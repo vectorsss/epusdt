@@ -2,7 +2,10 @@ package mq
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -162,36 +165,86 @@ func processCallback(tradeID string) {
 }
 
 func sendOrderCallback(order *mdb.Orders) error {
-	client := http_client.GetHttpClient()
-	orderResp := response.OrderNotifyResponse{
-		TradeId:            order.TradeId,
-		OrderId:            order.OrderId,
-		Amount:             order.Amount,
-		ActualAmount:       order.ActualAmount,
-		ReceiveAddress:     order.ReceiveAddress,
-		Token:              order.Token,
-		BlockTransactionId: order.BlockTransactionId,
-		Status:             mdb.StatusPaySuccess,
-	}
-	signature, err := sign.Get(orderResp, config.GetApiAuthToken())
-	if err != nil {
-		return err
-	}
-	orderResp.Signature = signature
 
-	resp, err := client.R().
-		SetHeader("powered-by", "Epusdt(https://github.com/GMwalletApp/epusdt)").
-		SetBody(orderResp).
-		Post(order.NotifyUrl)
-	if err != nil {
-		return err
+	switch order.PaymentType {
+	case mdb.PaymentTypeEpay:
+		// 构造 EPay 标准回调参数
+		notifyData := response.OrderNotifyResponseEpay{
+			PID:        config.GetEpayPid(),
+			TradeNo:    order.TradeId, // epusdt 订单号作为 EPay 平台订单号
+			OutTradeNo: order.OrderId, // 注意：EPay 回调要求商户订单号使用 out_trade_no 参数
+
+			Type:        "alipay",
+			Name:        order.Name,
+			Money:       fmt.Sprintf("%.4f", order.Amount),
+			TradeStatus: "TRADE_SUCCESS",
+		}
+
+		signstr2, err := sign.Get(notifyData, config.GetEpayKey())
+		if err != nil {
+			return err
+		}
+
+		// 使用 form-encoded POST（EPay 标准协议格式）
+		formData := url.Values{
+			"pid":          {fmt.Sprintf("%d", notifyData.PID)},
+			"trade_no":     {notifyData.TradeNo},
+			"out_trade_no": {notifyData.OutTradeNo},
+			"type":         {notifyData.Type},
+			"name":         {notifyData.Name},
+			"money":        {notifyData.Money},
+			"trade_status": {notifyData.TradeStatus},
+			"sign":         {signstr2},
+			"sign_type":    {"MD5"},
+		}
+
+		resp, err := http.PostForm(order.NotifyUrl, formData)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		responseBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("notify_url response status: %d, body: %s\n", resp.StatusCode, string(responseBody))
+
+	default:
+
+		client := http_client.GetHttpClient()
+		orderResp := response.OrderNotifyResponse{
+			TradeId:            order.TradeId,
+			OrderId:            order.OrderId,
+			Amount:             order.Amount,
+			ActualAmount:       order.ActualAmount,
+			ReceiveAddress:     order.ReceiveAddress,
+			Token:              order.Token,
+			BlockTransactionId: order.BlockTransactionId,
+			Status:             mdb.StatusPaySuccess,
+		}
+		signature, err := sign.Get(orderResp, config.GetApiAuthToken())
+		if err != nil {
+			return err
+		}
+		orderResp.Signature = signature
+
+		resp, err := client.R().
+			SetHeader("powered-by", "Epusdt(https://github.com/GMwalletApp/epusdt)").
+			SetBody(orderResp).
+			Post(order.NotifyUrl)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode() != http.StatusOK {
+			return errors.New(resp.Status())
+		}
+		if string(resp.Body()) != "ok" {
+			return errors.New("not ok")
+		}
 	}
-	if resp.StatusCode() != http.StatusOK {
-		return errors.New(resp.Status())
-	}
-	if string(resp.Body()) != "ok" {
-		return errors.New("not ok")
-	}
+
 	return nil
 }
 

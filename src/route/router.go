@@ -3,11 +3,17 @@ package route
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 
+	"github.com/assimon/luuu/config"
 	"github.com/assimon/luuu/controller/comm"
 	"github.com/assimon/luuu/middleware"
+	"github.com/assimon/luuu/model/mdb"
+	"github.com/assimon/luuu/util/constant"
+	"github.com/assimon/luuu/util/sign"
 	"github.com/labstack/echo/v4"
 )
 
@@ -49,6 +55,7 @@ func RegisterRoute(e *echo.Echo) {
 			return comm.Ctrl.FailJson(ctx, err)
 		}
 		ctx.Request().Body = io.NopCloser(bytes.NewBuffer(jsonBytes))
+		ctx.Request().ContentLength = int64(len(jsonBytes))
 
 		return comm.Ctrl.CreateTransaction(ctx)
 	}, middleware.CheckApiSign())
@@ -64,4 +71,66 @@ func RegisterRoute(e *echo.Echo) {
 	walletV1.GET("/:id", comm.Ctrl.GetWallet)
 	walletV1.POST("/:id/status", comm.Ctrl.ChangeWalletStatus)
 	walletV1.POST("/:id/delete", comm.Ctrl.DeleteWallet)
+
+	// epay v1 routes
+	epayV1 := paymentRoute.Group("/epay/v1")
+	epayV1.GET("/order/create-transaction/submit.php", func(ctx echo.Context) error {
+		money := ctx.QueryParam("money")
+		name := ctx.QueryParam("name")
+		notifyURL := ctx.QueryParam("notify_url")
+		outTradeNo := ctx.QueryParam("out_trade_no")
+		returnURL := ctx.QueryParam("return_url")
+		signstr := ctx.QueryParam("sign")
+		// signType := ctx.QueryParam("sign_type")
+
+		m := map[string]interface{}{
+			"money":        money,
+			"name":         name,
+			"notify_url":   notifyURL,
+			"out_trade_no": outTradeNo,
+			"pid":          config.GetEpayPid(), // 注意：验签时需要包含 pid 参数
+			"return_url":   returnURL,
+		}
+
+		checkSignature, err := sign.Get(m, config.GetApiAuthToken())
+		if err != nil {
+			return constant.SignatureErr
+		}
+		if checkSignature != signstr {
+			return constant.SignatureErr
+		}
+
+		amountFloat, err := strconv.ParseFloat(money, 64)
+		if err != nil {
+			return comm.Ctrl.FailJson(ctx, fmt.Errorf("invalid money value: %s", money))
+		}
+
+		body := map[string]interface{}{
+			"token":        "usdt",
+			"currency":     "cny",
+			"network":      "tron",
+			"amount":       amountFloat,
+			"notify_url":   notifyURL,
+			"order_id":     outTradeNo,
+			"redirect_url": returnURL,
+			"signature":    signstr,
+			"name":         name,
+			"payment_type": mdb.PaymentTypeEpay,
+		}
+
+		ctx.Set("request_body", body)
+
+		jsonBytes, err := json.Marshal(body)
+		if err != nil {
+			return comm.Ctrl.FailJson(ctx, err)
+		}
+
+		ctx.Request().Body = io.NopCloser(bytes.NewBuffer(jsonBytes))
+		ctx.Request().ContentLength = int64(len(jsonBytes))
+		ctx.Request().Method = http.MethodPost
+		ctx.Request().Header.Set("Content-Type", "application/json")
+
+		return comm.Ctrl.CreateTransactionAndRedirect(ctx)
+
+	})
 }

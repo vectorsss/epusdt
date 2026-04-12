@@ -340,3 +340,11 @@ func GetSolanaRpcUrl() string {
 func GetEthereumWsUrl() string {
 	return strings.TrimSpace(viper.GetString("ethereum_ws_url"))
 }
+
+func GetEpayPid() int {
+	return viper.GetInt("epay_pid")
+}
+
+func GetEpayKey() string {
+	return viper.GetString("epay_key")
+}

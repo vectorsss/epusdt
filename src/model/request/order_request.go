@@ -12,6 +12,8 @@ type CreateTransactionRequest struct {
 	NotifyUrl   string  `json:"notify_url" validate:"required"`
 	Signature   string  `json:"signature"  validate:"required"`
 	RedirectUrl string  `json:"redirect_url"`
+	Name        string  `json:"name"`
+	PaymentType string  `json:"payment_type"`
 }
 
 func (r CreateTransactionRequest) Translates() map[string]string {

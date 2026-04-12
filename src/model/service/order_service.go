@@ -95,6 +95,8 @@ func CreateTransaction(req *request.CreateTransactionRequest) (*response.CreateT
 		Status:         mdb.StatusWaitPay,
 		NotifyUrl:      req.NotifyUrl,
 		RedirectUrl:    req.RedirectUrl,
+		Name:           req.Name,
+		PaymentType:    req.PaymentType,
 	}
 	if err = data.CreateOrderWithTransaction(tx, order); err != nil {
 		tx.Rollback()
