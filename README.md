@@ -51,14 +51,14 @@ Deploy it privately, integrate via HTTP API, and start receiving **crypto paymen
 
 | 领域 | 已支持系统 |
 |------|-----------|
-| **AI 分发** | OneAPI、NewAPI |
-| **发卡系统** | 独角数卡（Dujiaoka）、异次元发卡 |
-| **代理面板** | V2Board、XBoard、SSPanel |
-| **建站生态** | WordPress、WHMCS |
+| **AI 分发** | [OneAPI](https://github.com/songquanpeng/one-api)、[NewAPI](https://github.com/QuantumNous/new-api) |
+| **发卡系统** | [独角数卡（Dujiaoka）](https://dujiao-next.com/)、[异次元发卡](https://github.com/lizhipay/acg-faka) |
+| **代理面板** | [V2Board](https://github.com/v2board/v2board)、[XBoard](https://github.com/cedar2025/Xboard)、[xiaoV2board](https://github.com/wyx2685/v2board/)、[SSPanel](https://github.com/anankke/sspanel-uim) |
+| **建站生态** | [WordPress](https://wordpress.com/)、[WHMCS](https://www.whmcs.com/) |
 | **Epay兼容** | 兼容各类支持Epay易支付接口的平台 |
 | **更多** | 简易HTTP API 10分钟内接入 |
-
-👉 查看完整集成列表与插件：[plugins/](plugins/)
+ 
+👉 查看更多集成列表与插件：[plugins/](plugins/)
 
 ---
 
