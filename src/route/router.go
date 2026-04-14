@@ -75,31 +75,63 @@ func RegisterRoute(e *echo.Echo) {
 
 	// epay v1 routes
 	epayV1 := paymentRoute.Group("/epay/v1")
-	epayV1.GET("/order/create-transaction/submit.php", func(ctx echo.Context) error {
-		money := ctx.QueryParam("money")
-		name := ctx.QueryParam("name")
-		notifyURL := ctx.QueryParam("notify_url")
-		outTradeNo := ctx.QueryParam("out_trade_no")
-		returnURL := ctx.QueryParam("return_url")
-		signstr := ctx.QueryParam("sign")
-		// signType := ctx.QueryParam("sign_type")
-
-		m := map[string]interface{}{
-			"money":        money,
-			"name":         name,
-			"notify_url":   notifyURL,
-			"out_trade_no": outTradeNo,
-			"pid":          config.GetEpayPid(), // 注意：验签时需要包含 pid 参数
-			"return_url":   returnURL,
+	epayV1.Match([]string{http.MethodPost, http.MethodGet}, "/order/create-transaction/submit.php", func(ctx echo.Context) error {
+		params := make(map[string]interface{})
+		copyParams := func(values map[string][]string) {
+			for k, v := range values {
+				if len(v) == 0 {
+					continue
+				}
+				params[k] = v[0]
+			}
 		}
 
-		checkSignature, err := sign.Get(m, config.GetApiAuthToken())
+		copyParams(ctx.QueryParams())
+
+		formParams, err := ctx.FormParams()
+		if err != nil && ctx.Request().Method == http.MethodPost {
+			return comm.Ctrl.FailJson(ctx, fmt.Errorf("invalid epay form params: %w", err))
+		}
+		if err == nil {
+			copyParams(formParams)
+		}
+
+		getString := func(m map[string]interface{}, key string) string {
+			v, ok := m[key]
+			if !ok {
+				return ""
+			}
+			s, ok := v.(string)
+			if !ok {
+				return ""
+			}
+			return s
+		}
+
+		signstr := getString(params, "sign")
+		if signstr == "" {
+			return constant.SignatureErr
+		}
+
+		delete(params, "sign")
+		delete(params, "sign_type")
+
+		// we need to add pid to params for signature verification
+		params["pid"] = config.GetEpayPid()
+
+		checkSignature, err := sign.Get(params, config.GetApiAuthToken())
 		if err != nil {
 			return constant.SignatureErr
 		}
 		if checkSignature != signstr {
 			return constant.SignatureErr
 		}
+
+		money := getString(params, "money")
+		name := getString(params, "name")
+		notifyURL := getString(params, "notify_url")
+		outTradeNo := getString(params, "out_trade_no")
+		returnURL := getString(params, "return_url")
 
 		amountFloat, err := strconv.ParseFloat(money, 64)
 		if err != nil {

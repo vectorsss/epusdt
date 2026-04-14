@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -28,6 +29,7 @@ func setupTestEnv(t *testing.T) *echo.Echo {
 	viper.Reset()
 	viper.Set("db_type", "sqlite")
 	viper.Set("api_auth_token", testAPIToken)
+	viper.Set("epay_pid", 1)
 	viper.Set("app_uri", "http://localhost:8080")
 	viper.Set("order_expiration_time", 10)
 	viper.Set("api_rate_url", "")
@@ -73,6 +75,28 @@ func doPost(e *echo.Echo, path string, body map[string]interface{}) *httptest.Re
 	jsonBytes, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(jsonBytes)))
 	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	return rec
+}
+
+func signEpayValues(values url.Values) url.Values {
+	signParams := make(map[string]interface{})
+	for key, items := range values {
+		if key == "sign" || key == "sign_type" || len(items) == 0 {
+			continue
+		}
+		signParams[key] = items[0]
+	}
+	sig, _ := sign.Get(signParams, testAPIToken)
+	values.Set("sign", sig)
+	values.Set("sign_type", "MD5")
+	return values
+}
+
+func doFormPost(e *echo.Echo, path string, values url.Values) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(values.Encode()))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationForm)
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 	return rec
@@ -399,5 +423,54 @@ func TestCreateOrderNetworkIsolation(t *testing.T) {
 	}
 	if data["receive_address"] != "SolTestAddress001" {
 		t.Errorf("expected SolTestAddress001, got %v", data["receive_address"])
+	}
+}
+
+func TestEpaySubmitPhpGetCompatible(t *testing.T) {
+	e := setupTestEnv(t)
+
+	values := signEpayValues(url.Values{
+		"pid":          {"1"},
+		"name":         {"epay-get-001"},
+		"type":         {"alipay"},
+		"money":        {"1.00"},
+		"out_trade_no": {"epay-get-001"},
+		"notify_url":   {"http://localhost/notify"},
+		"return_url":   {"http://localhost/return"},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/payments/epay/v1/order/create-transaction/submit.php?"+values.Encode(), nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.HasPrefix(rec.Header().Get("Location"), "/pay/checkout-counter/") {
+		t.Fatalf("expected checkout redirect, got %q", rec.Header().Get("Location"))
+	}
+}
+
+func TestEpaySubmitPhpPostFormCompatible(t *testing.T) {
+	e := setupTestEnv(t)
+
+	values := signEpayValues(url.Values{
+		"pid":          {"1"},
+		"name":         {"epay-post-001"},
+		"type":         {"alipay"},
+		"money":        {"1.00"},
+		"out_trade_no": {"epay-post-001"},
+		"notify_url":   {"http://localhost/notify"},
+		"return_url":   {"http://localhost/return"},
+		"sitename":     {"example-shop"},
+	})
+
+	rec := doFormPost(e, "/payments/epay/v1/order/create-transaction/submit.php", values)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected 302, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.HasPrefix(rec.Header().Get("Location"), "/pay/checkout-counter/") {
+		t.Fatalf("expected checkout redirect, got %q", rec.Header().Get("Location"))
 	}
 }
