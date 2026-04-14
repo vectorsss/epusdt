@@ -49,7 +49,7 @@ func StartBscWebSocketListener() {
 			storeBscRecipientsFromWallets(w)
 		}
 	}()
-	wsURL := "wss://bsc.publicnode.com"
+	wsURL := "wss://bsc.drpc.org"
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{
 			bscUsdtContract,
