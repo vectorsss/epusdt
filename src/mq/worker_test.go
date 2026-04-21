@@ -1,6 +1,7 @@
 package mq
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"github.com/assimon/luuu/model/dao"
 	"github.com/assimon/luuu/model/data"
 	"github.com/assimon/luuu/model/mdb"
+	"github.com/assimon/luuu/util/sign"
 )
 
 func TestProcessExpiredOrdersExpiresWaitingOrdersAndReleasesLocks(t *testing.T) {
@@ -158,6 +160,7 @@ func TestDispatchPendingCallbacksHonorsBackoffAndPersistsSuccess(t *testing.T) {
 		BlockTransactionId: "block_callback",
 		CallbackNum:        1,
 		CallBackConfirm:    mdb.CallBackConfirmNo,
+		ApiKeyID:           1, // seeded by testutil.SetupTestDatabases
 	}
 	if err := dao.Mdb.Create(order).Error; err != nil {
 		t.Fatalf("create callback order: %v", err)
@@ -218,6 +221,7 @@ func TestDispatchPendingCallbacksResumesRetryAfterRestart(t *testing.T) {
 		BlockTransactionId: "block_callback_restart",
 		CallbackNum:        0,
 		CallBackConfirm:    mdb.CallBackConfirmNo,
+		ApiKeyID:           1, // seeded by testutil.SetupTestDatabases
 	}
 	if err := dao.Mdb.Create(order).Error; err != nil {
 		t.Fatalf("create callback order: %v", err)
@@ -256,6 +260,403 @@ func TestDispatchPendingCallbacksResumesRetryAfterRestart(t *testing.T) {
 
 	if got := atomic.LoadInt32(&requestCount); got != 2 {
 		t.Fatalf("total callback request count = %d, want 2", got)
+	}
+}
+
+func TestDispatchPendingCallbacksEpayRequiresAck(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	callbackLimiter = make(chan struct{}, 1)
+	callbackInflight = sync.Map{}
+
+	epayKey, err := data.GetEnabledApiKey("1001")
+	if err != nil || epayKey == nil || epayKey.ID == 0 {
+		t.Fatalf("load epay key: %v", err)
+	}
+
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		http.Error(w, "fail", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	order := &mdb.Orders{
+		TradeId:            "trade_callback_epay_fail",
+		OrderId:            "order_callback_epay_fail",
+		Amount:             1,
+		Currency:           "CNY",
+		ActualAmount:       1,
+		ReceiveAddress:     "wallet_epay_fail",
+		Token:              "USDT",
+		Status:             mdb.StatusPaySuccess,
+		NotifyUrl:          server.URL,
+		BlockTransactionId: "block_callback_epay_fail",
+		CallbackNum:        0,
+		CallBackConfirm:    mdb.CallBackConfirmNo,
+		PaymentType:        mdb.PaymentTypeEpay,
+		ApiKeyID:           epayKey.ID,
+	}
+	if err := dao.Mdb.Create(order).Error; err != nil {
+		t.Fatalf("create callback order: %v", err)
+	}
+
+	dispatchPendingCallbacks()
+
+	waitFor(t, 3*time.Second, func() bool {
+		current, innerErr := data.GetOrderInfoByTradeId(order.TradeId)
+		if innerErr != nil || current.ID <= 0 {
+			return false
+		}
+		return current.CallBackConfirm == mdb.CallBackConfirmNo && current.CallbackNum == 1
+	})
+
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Fatalf("callback request count = %d, want 1", got)
+	}
+}
+
+func TestDispatchPendingCallbacksEpayAcceptsTrimmedOk(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	callbackLimiter = make(chan struct{}, 1)
+	callbackInflight = sync.Map{}
+
+	epayKey, err := data.GetEnabledApiKey("1001")
+	if err != nil || epayKey == nil || epayKey.ID == 0 {
+		t.Fatalf("load epay key: %v", err)
+	}
+
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		_, _ = io.WriteString(w, " ok\n")
+	}))
+	defer server.Close()
+
+	order := &mdb.Orders{
+		TradeId:            "trade_callback_epay_ok",
+		OrderId:            "order_callback_epay_ok",
+		Amount:             1,
+		Currency:           "CNY",
+		ActualAmount:       1,
+		ReceiveAddress:     "wallet_epay_ok",
+		Token:              "USDT",
+		Status:             mdb.StatusPaySuccess,
+		NotifyUrl:          server.URL,
+		BlockTransactionId: "block_callback_epay_ok",
+		CallbackNum:        0,
+		CallBackConfirm:    mdb.CallBackConfirmNo,
+		PaymentType:        mdb.PaymentTypeEpay,
+		ApiKeyID:           epayKey.ID,
+	}
+	if err := dao.Mdb.Create(order).Error; err != nil {
+		t.Fatalf("create callback order: %v", err)
+	}
+
+	dispatchPendingCallbacks()
+
+	waitFor(t, 3*time.Second, func() bool {
+		current, innerErr := data.GetOrderInfoByTradeId(order.TradeId)
+		if innerErr != nil || current.ID <= 0 {
+			return false
+		}
+		return current.CallBackConfirm == mdb.CallBackConfirmOk && current.CallbackNum == 1
+	})
+
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Fatalf("callback request count = %d, want 1", got)
+	}
+}
+
+// Orders must always carry an ApiKeyID (the default key is seeded at
+// bootstrap and the signing middleware / EPAY inline flow always
+// stamps it). If ApiKeyID is 0, resolveOrderApiKey returns an error —
+// the callback won't sign with a guess.
+func TestResolveOrderApiKeyRejectsZeroApiKeyID(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	order := &mdb.Orders{
+		TradeId:  "no-api-key-id",
+		ApiKeyID: 0,
+	}
+	if _, err := resolveOrderApiKey(order); err == nil {
+		t.Fatal("expected error for ApiKeyID=0")
+	}
+}
+
+// Happy path: when ApiKeyID points at an enabled row, resolveOrderApiKey
+// returns it.
+func TestResolveOrderApiKeyReturnsEnabledRow(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	row := &mdb.ApiKey{
+		Name:      "target",
+		Pid:       "target-key",
+		SecretKey: "target-secret",
+		Status:    mdb.ApiKeyStatusEnable,
+	}
+	if err := dao.Mdb.Create(row).Error; err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+	order := &mdb.Orders{
+		TradeId:  "happy-path",
+		ApiKeyID: row.ID,
+	}
+	got, err := resolveOrderApiKey(order)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got == nil || got.ID != row.ID {
+		t.Fatalf("resolved row = %+v, want id=%d", got, row.ID)
+	}
+}
+
+func TestSendOrderCallbackGmpayUsesApiKeySecretByPid(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	key := &mdb.ApiKey{
+		Name:      "gmpay-key",
+		Pid:       "9001",
+		SecretKey: "gmpay-secret-9001",
+		Status:    mdb.ApiKeyStatusEnable,
+	}
+	if err := dao.Mdb.Create(key).Error; err != nil {
+		t.Fatalf("create gmpay api key: %v", err)
+	}
+
+	warningKey := &mdb.ApiKey{
+		Name:      "wrong-key",
+		Pid:       "9002",
+		SecretKey: "wrong-secret-9002",
+		Status:    mdb.ApiKeyStatusEnable,
+	}
+	if err := dao.Mdb.Create(warningKey).Error; err != nil {
+		t.Fatalf("create wrong api key: %v", err)
+	}
+
+	var received map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &received)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	order := &mdb.Orders{
+		TradeId:            "trade_gmpay_sign",
+		OrderId:            "order_gmpay_sign",
+		Amount:             1,
+		Currency:           "CNY",
+		ActualAmount:       1,
+		ReceiveAddress:     "wallet_gmpay",
+		Token:              "USDT",
+		Status:             mdb.StatusPaySuccess,
+		NotifyUrl:          server.URL,
+		BlockTransactionId: "block_gmpay_sign",
+		ApiKeyID:           key.ID,
+	}
+
+	if err := sendOrderCallback(order); err != nil {
+		t.Fatalf("send callback: %v", err)
+	}
+
+	if received == nil {
+		t.Fatal("expected callback payload")
+	}
+	if gotPid, _ := received["pid"].(string); gotPid != key.Pid {
+		t.Fatalf("payload pid = %q, want %q", gotPid, key.Pid)
+	}
+
+	recvSig, _ := received["signature"].(string)
+	if recvSig == "" {
+		t.Fatal("payload signature is empty")
+	}
+	delete(received, "signature")
+
+	calcSig, err := sign.Get(received, key.SecretKey)
+	if err != nil {
+		t.Fatalf("calc signature with target secret: %v", err)
+	}
+	if recvSig != calcSig {
+		t.Fatalf("signature mismatch: got %q want %q", recvSig, calcSig)
+	}
+
+	wrongSig, err := sign.Get(received, warningKey.SecretKey)
+	if err != nil {
+		t.Fatalf("calc signature with wrong secret: %v", err)
+	}
+	if recvSig == wrongSig {
+		t.Fatal("signature should not match wrong api key secret")
+	}
+}
+
+func TestSendOrderCallbackEpayUsesApiKeySecretByPid(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	key := &mdb.ApiKey{
+		Name:      "epay-key",
+		Pid:       "9101",
+		SecretKey: "epay-secret-9101",
+		Status:    mdb.ApiKeyStatusEnable,
+	}
+	if err := dao.Mdb.Create(key).Error; err != nil {
+		t.Fatalf("create epay api key: %v", err)
+	}
+
+	warningKey := &mdb.ApiKey{
+		Name:      "wrong-epay-key",
+		Pid:       "9102",
+		SecretKey: "wrong-epay-secret-9102",
+		Status:    mdb.ApiKeyStatusEnable,
+	}
+	if err := dao.Mdb.Create(warningKey).Error; err != nil {
+		t.Fatalf("create wrong epay api key: %v", err)
+	}
+
+	formPayload := map[string]string{}
+	callbackMethod := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callbackMethod = r.Method
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for k, v := range r.Form {
+			if len(v) > 0 {
+				formPayload[k] = v[0]
+			}
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	order := &mdb.Orders{
+		TradeId:            "trade_epay_sign",
+		OrderId:            "order_epay_sign",
+		Amount:             1,
+		Currency:           "CNY",
+		ActualAmount:       1,
+		ReceiveAddress:     "wallet_epay",
+		Token:              "USDT",
+		Name:               "VIP",
+		Status:             mdb.StatusPaySuccess,
+		NotifyUrl:          server.URL,
+		BlockTransactionId: "block_epay_sign",
+		PaymentType:        mdb.PaymentTypeEpay,
+		ApiKeyID:           key.ID,
+	}
+
+	if err := sendOrderCallback(order); err != nil {
+		t.Fatalf("send epay callback: %v", err)
+	}
+
+	if callbackMethod != http.MethodGet {
+		t.Fatalf("callback method = %s, want %s", callbackMethod, http.MethodGet)
+	}
+	if formPayload["sign_type"] != "MD5" {
+		t.Fatalf("sign_type = %q, want MD5", formPayload["sign_type"])
+	}
+	if formPayload["type"] != "alipay" {
+		t.Fatalf("type = %q, want alipay", formPayload["type"])
+	}
+	if formPayload["trade_status"] != "TRADE_SUCCESS" {
+		t.Fatalf("trade_status = %q, want TRADE_SUCCESS", formPayload["trade_status"])
+	}
+
+	if formPayload["pid"] != key.Pid {
+		t.Fatalf("form pid = %q, want %q", formPayload["pid"], key.Pid)
+	}
+	recvSig := formPayload["sign"]
+	if recvSig == "" {
+		t.Fatal("epay sign is empty")
+	}
+
+	signParams := map[string]interface{}{
+		"pid":          formPayload["pid"],
+		"trade_no":     formPayload["trade_no"],
+		"out_trade_no": formPayload["out_trade_no"],
+		"type":         formPayload["type"],
+		"name":         formPayload["name"],
+		"money":        formPayload["money"],
+		"trade_status": formPayload["trade_status"],
+	}
+
+	calcSig, err := sign.Get(signParams, key.SecretKey)
+	if err != nil {
+		t.Fatalf("calc epay signature with target secret: %v", err)
+	}
+	if recvSig != calcSig {
+		t.Fatalf("epay signature mismatch: got %q want %q", recvSig, calcSig)
+	}
+
+	wrongSig, err := sign.Get(signParams, warningKey.SecretKey)
+	if err != nil {
+		t.Fatalf("calc epay signature with wrong secret: %v", err)
+	}
+	if recvSig == wrongSig {
+		t.Fatal("epay signature should not match wrong api key secret")
+	}
+}
+
+func TestDispatchPendingCallbacksEpayAcceptsSuccessAck(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	callbackLimiter = make(chan struct{}, 1)
+	callbackInflight = sync.Map{}
+
+	epayKey, err := data.GetEnabledApiKey("1001")
+	if err != nil || epayKey == nil || epayKey.ID == 0 {
+		t.Fatalf("load epay key: %v", err)
+	}
+
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		_, _ = io.WriteString(w, "success")
+	}))
+	defer server.Close()
+
+	order := &mdb.Orders{
+		TradeId:            "trade_callback_epay_success",
+		OrderId:            "order_callback_epay_success",
+		Amount:             1,
+		Currency:           "CNY",
+		ActualAmount:       1,
+		ReceiveAddress:     "wallet_epay_success",
+		Token:              "USDT",
+		Status:             mdb.StatusPaySuccess,
+		NotifyUrl:          server.URL,
+		BlockTransactionId: "block_callback_epay_success",
+		CallbackNum:        0,
+		CallBackConfirm:    mdb.CallBackConfirmNo,
+		PaymentType:        mdb.PaymentTypeEpay,
+		ApiKeyID:           epayKey.ID,
+	}
+	if err := dao.Mdb.Create(order).Error; err != nil {
+		t.Fatalf("create callback order: %v", err)
+	}
+
+	dispatchPendingCallbacks()
+
+	waitFor(t, 3*time.Second, func() bool {
+		current, innerErr := data.GetOrderInfoByTradeId(order.TradeId)
+		if innerErr != nil || current.ID <= 0 {
+			return false
+		}
+		return current.CallBackConfirm == mdb.CallBackConfirmOk && current.CallbackNum == 1
+	})
+
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Fatalf("callback request count = %d, want 1", got)
 	}
 }
 

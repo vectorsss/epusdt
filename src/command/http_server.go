@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"time"
 
 	"github.com/assimon/luuu/bootstrap"
 	"github.com/assimon/luuu/config"
+	"github.com/assimon/luuu/install"
 	"github.com/assimon/luuu/middleware"
 	"github.com/assimon/luuu/route"
 	"github.com/assimon/luuu/util/constant"
@@ -37,6 +39,14 @@ var startCmd = &cobra.Command{
 	Short: "start",
 	Long:  "start http service",
 	Run: func(cmd *cobra.Command, args []string) {
+		// If no config file exists, or if install=true is set in the config,
+		// run the first-run install API on the same port as the main server.
+		// The wizard writes the .env (with install=false) and shuts itself
+		// down so bootstrap.InitApp() can read it normally on the same port.
+		if config.NeedsInstall() {
+			envPath, _ := config.ResolveConfigPath()
+			install.RunInstallServer(install.DefaultInstallAddr, envPath)
+		}
 		bootstrap.InitApp()
 		printBanner()
 		HttpServerStart()
@@ -52,6 +62,20 @@ func HttpServerStart() {
 	MiddlewareRegister(e)
 	route.RegisterRoute(e)
 	e.Static(config.StaticPath, config.StaticFilePath)
+
+	// Resolve www/ relative to the executable so SPA routes work regardless
+	// of the working directory. main.go extracts www/ next to the binary.
+	wwwRoot := "./www"
+	if exePath, err := os.Executable(); err == nil {
+		if exePath, err = filepath.EvalSymlinks(exePath); err == nil {
+			wwwRoot = filepath.Join(filepath.Dir(exePath), "www")
+		}
+	}
+	e.Use(echoMiddleware.StaticWithConfig(echoMiddleware.StaticConfig{
+		HTML5: true,
+		Index: "index.html",
+		Root:  wwwRoot,
+	}))
 
 	httpListen := viper.GetString("http_listen")
 	go func() {
@@ -86,13 +110,28 @@ func customHTTPErrorHandler(err error, e echo.Context) {
 		Message:    msg,
 		RequestID:  e.Request().Header.Get(echo.HeaderXRequestID),
 	}
+	// echo.HTTPError carries a real HTTP status (401 for auth failures,
+	// 404 for missing routes, etc.). Propagate it instead of flattening
+	// everything to 200 — clients rely on the status code.
 	if he, ok := err.(*echo.HTTPError); ok {
-		e.String(http.StatusOK, he.Message.(string))
+		resp.StatusCode = he.Code
+		if s, ok := he.Message.(string); ok {
+			resp.Message = s
+		} else if he.Message != nil {
+			resp.Message = http.StatusText(he.Code)
+		}
+		_ = e.JSON(he.Code, resp)
 		return
 	}
+	// Internal RspError: propagate Code as both the JSON status_code and
+	// the real HTTP status when it maps to one (400/401/...); business
+	// codes (>=1000) map to HTTP 400 so clients get a proper 4xx while
+	// still reading the granular code from the body.
 	if he, ok := err.(*constant.RspError); ok {
 		resp.StatusCode = he.Code
 		resp.Message = he.Msg
+		_ = e.JSON(he.HttpStatus(), resp)
+		return
 	}
-	_ = e.JSON(http.StatusOK, resp)
+	_ = e.JSON(http.StatusInternalServerError, resp)
 }

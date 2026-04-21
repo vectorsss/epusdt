@@ -8,6 +8,7 @@ require (
 	github.com/ethereum/go-ethereum v1.15.11
 	github.com/gagliardetto/solana-go v1.16.0
 	github.com/go-resty/resty/v2 v2.11.0
+	github.com/golang-jwt/jwt/v4 v4.5.1
 	github.com/gookit/color v1.5.0
 	github.com/gookit/goutil v0.4.6
 	github.com/gookit/validate v1.3.1
@@ -23,6 +24,7 @@ require (
 	github.com/spf13/viper v1.20.1
 	github.com/tidwall/gjson v1.18.0
 	go.uber.org/zap v1.27.0
+	golang.org/x/crypto v0.48.0
 	gopkg.in/telebot.v3 v3.0.0
 	gorm.io/driver/mysql v1.5.1
 	gorm.io/driver/postgres v1.5.2
@@ -99,12 +101,11 @@ require (
 	github.com/xo/terminfo v0.0.0-20210125001918-ca9a967f8778 // indirect
 	go.mongodb.org/mongo-driver v1.17.3 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.47.0 // indirect
-	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/term v0.39.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/term v0.40.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.70.0 // indirect

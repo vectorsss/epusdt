@@ -22,15 +22,22 @@ func isEVMNetwork(network string) bool {
 	return false
 }
 
+func normalizeWalletNetwork(network string) string {
+	return strings.ToLower(strings.TrimSpace(network))
+}
+
+func normalizeWalletAddressByNetwork(network, address string) string {
+	address = strings.TrimSpace(address)
+	if isEVMNetwork(normalizeWalletNetwork(network)) {
+		return strings.ToLower(address)
+	}
+	return address
+}
+
 // AddWalletAddressWithNetwork 创建指定网络的钱包地址
 func AddWalletAddressWithNetwork(network, address string) (*mdb.WalletAddress, error) {
-	network = strings.ToLower(strings.TrimSpace(network))
-	address = strings.TrimSpace(address)
-
-	// evm 网络地址统一小写，tron 和 solana 保持原样
-	if isEVMNetwork(network) {
-		address = strings.ToLower(address)
-	}
+	network = normalizeWalletNetwork(network)
+	address = normalizeWalletAddressByNetwork(network, address)
 
 	exist, err := GetWalletAddressByNetworkAndAddress(network, address)
 	if err != nil {
@@ -39,6 +46,23 @@ func AddWalletAddressWithNetwork(network, address string) (*mdb.WalletAddress, e
 	if exist.ID > 0 {
 		return nil, constant.WalletAddressAlreadyExists
 	}
+
+	// Check for a soft-deleted record with the same (network, address) and restore it.
+	deleted := new(mdb.WalletAddress)
+	err = dao.Mdb.Unscoped().
+		Where("network = ? AND address = ? AND deleted_at IS NOT NULL", network, address).
+		Limit(1).Find(deleted).Error
+	if err != nil {
+		return nil, err
+	}
+	if deleted.ID > 0 {
+		err = dao.Mdb.Unscoped().Model(deleted).Updates(map[string]interface{}{
+			"deleted_at": nil,
+			"status":     mdb.TokenStatusEnable,
+		}).Error
+		return deleted, err
+	}
+
 	walletAddress := &mdb.WalletAddress{
 		Network: network,
 		Address: address,
@@ -50,6 +74,8 @@ func AddWalletAddressWithNetwork(network, address string) (*mdb.WalletAddress, e
 
 // GetWalletAddressByNetworkAndAddress 通过网络和地址查询
 func GetWalletAddressByNetworkAndAddress(network, address string) (*mdb.WalletAddress, error) {
+	network = normalizeWalletNetwork(network)
+	address = normalizeWalletAddressByNetwork(network, address)
 	walletAddress := new(mdb.WalletAddress)
 	err := dao.Mdb.Model(walletAddress).
 		Where("network = ?", network).
@@ -87,11 +113,20 @@ func GetAvailableWalletAddress() ([]mdb.WalletAddress, error) {
 
 // GetAvailableWalletAddressByNetwork 获得指定网络的所有可用钱包地址
 func GetAvailableWalletAddressByNetwork(network string) ([]mdb.WalletAddress, error) {
+	network = normalizeWalletNetwork(network)
 	var list []mdb.WalletAddress
 	err := dao.Mdb.Model(list).
 		Where("status = ?", mdb.TokenStatusEnable).
 		Where("network = ?", network).
 		Find(&list).Error
+	if err != nil {
+		return nil, err
+	}
+	if isEVMNetwork(network) {
+		for i := range list {
+			list[i].Address = strings.ToLower(strings.TrimSpace(list[i].Address))
+		}
+	}
 	return list, err
 }
 
@@ -104,8 +139,17 @@ func GetAllWalletAddress() ([]mdb.WalletAddress, error) {
 
 // GetAllWalletAddressByNetwork 获得指定网络的所有钱包地址
 func GetAllWalletAddressByNetwork(network string) ([]mdb.WalletAddress, error) {
+	network = normalizeWalletNetwork(network)
 	var list []mdb.WalletAddress
 	err := dao.Mdb.Model(list).Where("network = ?", network).Find(&list).Error
+	if err != nil {
+		return nil, err
+	}
+	if isEVMNetwork(network) {
+		for i := range list {
+			list[i].Address = strings.ToLower(strings.TrimSpace(list[i].Address))
+		}
+	}
 	return list, err
 }
 

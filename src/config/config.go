@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +15,12 @@ import (
 	"github.com/spf13/viper"
 	"github.com/tidwall/gjson"
 )
+
+// parseFloat is the minimal helper used by the settings bridge; kept
+// here so settings_bridge.go stays import-free.
+func parseFloat(s string) (float64, error) {
+	return strconv.ParseFloat(strings.TrimSpace(s), 64)
+}
 
 var (
 	HTTPAccessLog      bool
@@ -124,6 +131,57 @@ func resolveConfigFilePath() (string, error) {
 	return normalizeConfiguredPath(".env")
 }
 
+// NeedsInstall returns true when the first-run install wizard should run.
+// It returns true if the config file does not exist yet, or if the file
+// exists and contains install=true (an explicit reset flag).
+// Existing installs that have no install key are NOT affected.
+func NeedsInstall() bool {
+	envPath, exists := ResolveConfigPath()
+	if !exists {
+		return true
+	}
+	// Read just the install key without triggering full Init().
+	v := viper.New()
+	v.SetConfigFile(envPath)
+	if err := v.ReadInConfig(); err != nil {
+		// Unreadable config → treat as needing install.
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(v.GetString("install")), "true")
+}
+
+// ResolveConfigPath returns the absolute path to the .env file and whether
+// it currently exists on disk. Unlike resolveConfigFilePath it does not
+// return an error when the file is absent — callers (e.g. the install
+// wizard) need the target path even before the file is written.
+func ResolveConfigPath() (path string, exists bool) {
+	candidate := explicitConfigPath
+	if candidate == "" {
+		if e := strings.TrimSpace(os.Getenv("EPUSDT_CONFIG")); e != "" {
+			candidate = e
+		} else {
+			candidate = ".env"
+		}
+	}
+	// Resolve relative paths against cwd.
+	p := strings.TrimSpace(candidate)
+	if !filepath.IsAbs(p) {
+		cwd, err := os.Getwd()
+		if err == nil {
+			p = filepath.Join(cwd, p)
+		}
+	}
+	info, err := os.Stat(p)
+	if err == nil && info.IsDir() {
+		p = filepath.Join(p, ".env")
+		info, err = os.Stat(p)
+	}
+	if err != nil {
+		return p, false
+	}
+	return p, true
+}
+
 func normalizeConfiguredPath(input string) (string, error) {
 	path := strings.TrimSpace(input)
 	if path == "" {
@@ -178,11 +236,19 @@ func GetAppUri() string {
 	return viper.GetString("app_uri")
 }
 
-func GetApiAuthToken() string {
-	return viper.GetString("api_auth_token")
+func GetRateApiUrl() string {
+	// settings table wins (admin-configurable); .env and env var remain
+	// as fallbacks for smooth migration from the old layout.
+	if db := settingsRateApiUrl(); db != "" {
+		return db
+	}
+	return GetRateApiUrlFromEnv()
 }
 
-func GetRateApiUrl() string {
+// GetRateApiUrlFromEnv returns the rate API URL read only from the
+// .env / environment variables, bypassing the settings table. Used
+// by bootstrap to seed the settings table from the initial .env value.
+func GetRateApiUrlFromEnv() string {
 	rateURL := viper.GetString("api_rate_url")
 	if rateURL == "" {
 		rateURL = os.Getenv("API_RATE_URL")
@@ -190,7 +256,6 @@ func GetRateApiUrl() string {
 	if rateURL == "" {
 		log.Println("api_rate_url is empty")
 	}
-	RateApiUrl = rateURL
 	return rateURL
 }
 
@@ -250,6 +315,11 @@ func GetRateForCoin(coin string, base string) float64 {
 }
 
 func GetUsdtRate() float64 {
+	// Prefer the DB-backed override (admin-configurable). Fall back to
+	// the legacy .env var, then the hardcoded 6.4 default.
+	if forced := settingsForcedUsdtRate(); forced > 0 {
+		return forced
+	}
 	forcedUsdtRate := viper.GetFloat64("forced_usdt_rate")
 	if forcedUsdtRate > 0 {
 		return forcedUsdtRate
@@ -339,12 +409,4 @@ func GetSolanaRpcUrl() string {
 
 func GetEthereumWsUrl() string {
 	return strings.TrimSpace(viper.GetString("ethereum_ws_url"))
-}
-
-func GetEpayPid() int {
-	return viper.GetInt("epay_pid")
-}
-
-func GetEpayKey() string {
-	return viper.GetString("epay_key")
 }

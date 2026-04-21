@@ -58,16 +58,21 @@ func (r *Resp) SucJsonPage(e echo.Context, data interface{}, pagination page.Pag
 	return r.SucJson(e, pageDate, message...)
 }
 
-// FailJson 失败json
+// FailJson 失败json —  Propagates semantic HTTP status codes to the
+// wire. RspError.Code in the 4xx/5xx range is used directly; business
+// codes (>=1000) map to HTTP 400 with the specific code still visible
+// in the body's status_code field.
 func (r *Resp) FailJson(e echo.Context, err error) error {
 	rr := new(Response)
-	switch err.(type) {
+	httpStatus := http.StatusBadRequest
+	switch t := err.(type) {
 	case *constant.RspError:
-		rr.StatusCode, rr.Message = err.(*constant.RspError).Render()
+		rr.StatusCode, rr.Message = t.Render()
+		httpStatus = t.HttpStatus()
 	default:
-		rr.StatusCode = 400
+		rr.StatusCode = http.StatusBadRequest
 		rr.Message = err.Error()
 	}
 	rr.RequestID = e.Request().Header.Get(echo.HeaderXRequestID)
-	return r.Json(e, http.StatusOK, &rr)
+	return r.Json(e, httpStatus, &rr)
 }

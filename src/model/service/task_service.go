@@ -14,7 +14,7 @@ import (
 	"github.com/assimon/luuu/model/data"
 	"github.com/assimon/luuu/model/mdb"
 	"github.com/assimon/luuu/model/request"
-	"github.com/assimon/luuu/telegram"
+	"github.com/assimon/luuu/notify"
 	"github.com/assimon/luuu/util/constant"
 	"github.com/assimon/luuu/util/http_client"
 	"github.com/assimon/luuu/util/log"
@@ -26,7 +26,20 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const TRC20_USDT_ID = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+// tronNodeDefault is the fallback when no rpc_nodes row exists for TRON.
+const tronNodeDefault = "https://api.trongrid.io"
+
+// resolveTronNode returns (baseURL, apiKey) for the TRON HTTP RPC node.
+// It reads the first healthy (or any enabled) row from the rpc_nodes table;
+// if none exists it falls back to the hard-coded default URL and the
+// tron_grid_api_key value from .env (config.TRON_GRID_API_KEY).
+func resolveTronNode() (string, string) {
+	node, err := data.SelectRpcNode(mdb.NetworkTron, mdb.RpcNodeTypeHttp)
+	if err == nil && node != nil && node.ID > 0 {
+		return strings.TrimRight(node.Url, "/"), node.ApiKey
+	}
+	return tronNodeDefault, config.TRON_GRID_API_KEY
+}
 
 func Trc20CallBack(address string, wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -45,16 +58,29 @@ func Trc20CallBack(address string, wg *sync.WaitGroup) {
 
 func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer func() {
-		if err := recover(); err != nil {
-			log.Sugar.Errorf("[TRX][%s] panic recovered: %v", address, err)
-		}
-	}()
+
+	// Native TRX is gated by a chain_tokens row with empty
+	// contract_address and symbol=TRX. Admin can disable this row to
+	// stop scanning native transfers without touching the chain toggle.
+	trxCfg, err := data.GetEnabledChainTokenBySymbol(mdb.NetworkTron, "TRX")
+	if err != nil {
+		log.Sugar.Errorf("[TRX][%s] load chain_tokens err=%v", address, err)
+		return
+	}
+	if trxCfg == nil || trxCfg.ID == 0 {
+		log.Sugar.Debugf("[TRX][%s] native TRX disabled in chain_tokens, skipping", address)
+		return
+	}
+	trxDecimals := trxCfg.Decimals
+	if trxDecimals <= 0 {
+		trxDecimals = 6
+	}
 
 	client := http_client.GetHttpClient()
 	startTime := carbon.Now().AddHours(-24).TimestampMilli()
 	endTime := carbon.Now().TimestampMilli()
-	url := fmt.Sprintf("https://api.trongrid.io/v1/accounts/%s/transactions", address)
+	tronBaseURL, tronAPIKey := resolveTronNode()
+	url := fmt.Sprintf("%s/v1/accounts/%s/transactions", tronBaseURL, address)
 
 	resp, err := client.R().SetQueryParams(map[string]string{
 		"order_by":      "block_timestamp,desc",
@@ -62,17 +88,20 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 		"only_to":       "true",
 		"min_timestamp": stdutil.ToString(startTime),
 		"max_timestamp": stdutil.ToString(endTime),
-	}).SetHeader("TRON-PRO-API-KEY", config.TRON_GRID_API_KEY).Get(url)
+	}).SetHeader("TRON-PRO-API-KEY", tronAPIKey).Get(url)
 	if err != nil {
-		panic(err)
+		log.Sugar.Errorf("[TRX][%s] HTTP request failed: %v", address, err)
+		return
 	}
 	if resp.StatusCode() != http.StatusOK {
-		panic(fmt.Sprintf("TRX API returned status %d", resp.StatusCode()))
+		log.Sugar.Errorf("[TRX][%s] API returned status %d", address, resp.StatusCode())
+		return
 	}
 
 	success := gjson.GetBytes(resp.Body(), "success").Bool()
 	if !success {
-		panic("TRX API response indicates failure")
+		log.Sugar.Errorf("[TRX][%s] API response indicates failure", address)
+		return
 	}
 
 	transfers := gjson.GetBytes(resp.Body(), "data").Array()
@@ -106,15 +135,19 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 			log.Sugar.Errorf("[TRX][%s] parse amount failed on tx #%d: %v", address, i, err)
 			continue
 		}
-		amount := math.MustParsePrecFloat64(decimalQuant.Div(decimal.NewFromInt(1000000)).InexactFloat64(), 2)
+		amount := math.MustParsePrecFloat64(decimalQuant.Div(decimal.New(1, int32(trxDecimals))).InexactFloat64(), 2)
+		if trxCfg.MinAmount > 0 && amount < trxCfg.MinAmount {
+			continue
+		}
 		if amount <= 0 {
 			continue
 		}
 
 		txID := transfer.Get("txID").String()
-		tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkTron, address, "TRX", amount)
+		tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkTron, address, strings.ToUpper(strings.TrimSpace(trxCfg.Symbol)), amount)
 		if err != nil {
-			panic(err)
+			log.Sugar.Errorf("[TRX][%s] lookup trade_id failed hash=%s err=%v", address, txID, err)
+			continue
 		}
 		if tradeID == "" {
 			log.Sugar.Debugf("[TRX][%s] skip unmatched tx hash=%s amount=%.2f", address, txID, amount)
@@ -124,7 +157,8 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 
 		order, err := data.GetOrderInfoByTradeId(tradeID)
 		if err != nil {
-			panic(err)
+			log.Sugar.Errorf("[TRX][%s] get order failed trade_id=%s err=%v", address, tradeID, err)
+			continue
 		}
 		blockTimestamp := transfer.Get("block_timestamp").Int()
 		createTime := order.CreatedAt.TimestampMilli()
@@ -135,7 +169,7 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 
 		req := &request.OrderProcessingRequest{
 			ReceiveAddress:     address,
-			Token:              "TRX",
+			Token:              strings.ToUpper(strings.TrimSpace(trxCfg.Symbol)),
 			Network:            mdb.NetworkTron,
 			TradeId:            tradeID,
 			Amount:             amount,
@@ -147,7 +181,8 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 				log.Sugar.Infof("[TRX][%s] skip resolved transfer trade_id=%s hash=%s err=%v", address, tradeID, txID, err)
 				continue
 			}
-			panic(err)
+			log.Sugar.Errorf("[TRX][%s] order processing failed trade_id=%s hash=%s err=%v", address, tradeID, txID, err)
+			continue
 		}
 
 		sendPaymentNotification(order)
@@ -157,16 +192,33 @@ func checkTrxTransfers(address string, wg *sync.WaitGroup) {
 
 func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer func() {
-		if err := recover(); err != nil {
-			log.Sugar.Errorf("[TRC20][%s] panic recovered: %v", address, err)
+
+	// Build contract -> token map for the TRON network. If nothing is
+	// configured, skip — preserves the previous behavior of only watching
+	// admin-approved tokens.
+	tokens, err := data.ListEnabledChainTokensByNetwork(mdb.NetworkTron)
+	if err != nil {
+		log.Sugar.Errorf("[TRC20][%s] load chain_tokens err=%v", address, err)
+		return
+	}
+	if len(tokens) == 0 {
+		log.Sugar.Debugf("[TRC20][%s] no enabled chain_tokens, skipping", address)
+		return
+	}
+	contractTokens := make(map[string]*mdb.ChainToken, len(tokens))
+	for i := range tokens {
+		c := strings.TrimSpace(tokens[i].ContractAddress)
+		if c == "" {
+			continue
 		}
-	}()
+		contractTokens[c] = &tokens[i]
+	}
 
 	client := http_client.GetHttpClient()
 	startTime := carbon.Now().AddHours(-24).TimestampMilli()
 	endTime := carbon.Now().TimestampMilli()
-	url := fmt.Sprintf("https://api.trongrid.io/v1/accounts/%s/transactions/trc20", address)
+	tronBaseURL, tronAPIKey := resolveTronNode()
+	url := fmt.Sprintf("%s/v1/accounts/%s/transactions/trc20", tronBaseURL, address)
 
 	resp, err := client.R().SetQueryParams(map[string]string{
 		"order_by":      "block_timestamp,desc",
@@ -174,17 +226,20 @@ func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 		"only_to":       "true",
 		"min_timestamp": stdutil.ToString(startTime),
 		"max_timestamp": stdutil.ToString(endTime),
-	}).SetHeader("TRON-PRO-API-KEY", config.TRON_GRID_API_KEY).Get(url)
+	}).SetHeader("TRON-PRO-API-KEY", tronAPIKey).Get(url)
 	if err != nil {
-		panic(err)
+		log.Sugar.Errorf("[TRC20][%s] HTTP request failed: %v", address, err)
+		return
 	}
 	if resp.StatusCode() != http.StatusOK {
-		panic(fmt.Sprintf("TRC20 API returned status %d", resp.StatusCode()))
+		log.Sugar.Errorf("[TRC20][%s] API returned status %d", address, resp.StatusCode())
+		return
 	}
 
 	success := gjson.GetBytes(resp.Body(), "success").Bool()
 	if !success {
-		panic("TRC20 API response indicates failure")
+		log.Sugar.Errorf("[TRC20][%s] API response indicates failure", address)
+		return
 	}
 
 	transfers := gjson.GetBytes(resp.Body(), "data").Array()
@@ -195,12 +250,15 @@ func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 	log.Sugar.Debugf("[TRC20][%s] fetched %d transfer records", address, len(transfers))
 
 	for i, transfer := range transfers {
-		if transfer.Get("token_info.address").String() != TRC20_USDT_ID {
+		contractAddr := transfer.Get("token_info.address").String()
+		cfg, ok := contractTokens[contractAddr]
+		if !ok {
 			continue
 		}
 		if transfer.Get("to").String() != address {
 			continue
 		}
+		tokenSym := strings.ToUpper(strings.TrimSpace(cfg.Symbol))
 
 		valueStr := transfer.Get("value").String()
 		decimalQuant, err := decimal.NewFromString(valueStr)
@@ -209,25 +267,33 @@ func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 			continue
 		}
 		tokenDecimals := transfer.Get("token_info.decimals").Int()
+		if tokenDecimals <= 0 {
+			tokenDecimals = int64(cfg.Decimals)
+		}
 		amount := math.MustParsePrecFloat64(decimalQuant.Div(decimal.New(1, int32(tokenDecimals))).InexactFloat64(), 2)
+		if cfg.MinAmount > 0 && amount < cfg.MinAmount {
+			continue
+		}
 		if amount <= 0 {
 			continue
 		}
 
 		txID := transfer.Get("transaction_id").String()
-		tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkTron, address, "USDT", amount)
+		tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkTron, address, tokenSym, amount)
 		if err != nil {
-			panic(err)
-		}
-		if tradeID == "" {
-			log.Sugar.Debugf("[TRC20][%s] skip unmatched tx hash=%s amount=%.2f", address, txID, amount)
+			log.Sugar.Errorf("[TRC20][%s] lookup trade_id failed hash=%s err=%v", address, txID, err)
 			continue
 		}
-		log.Sugar.Infof("[TRC20][%s] matched trade_id=%s hash=%s amount=%.2f", address, tradeID, txID, amount)
+		if tradeID == "" {
+			log.Sugar.Debugf("[TRC20][%s] skip unmatched %s tx hash=%s amount=%.2f", address, tokenSym, txID, amount)
+			continue
+		}
+		log.Sugar.Infof("[TRC20][%s] matched %s trade_id=%s hash=%s amount=%.2f", address, tokenSym, tradeID, txID, amount)
 
 		order, err := data.GetOrderInfoByTradeId(tradeID)
 		if err != nil {
-			panic(err)
+			log.Sugar.Errorf("[TRC20][%s] get order failed trade_id=%s err=%v", address, tradeID, err)
+			continue
 		}
 		blockTimestamp := transfer.Get("block_timestamp").Int()
 		createTime := order.CreatedAt.TimestampMilli()
@@ -238,7 +304,7 @@ func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 
 		req := &request.OrderProcessingRequest{
 			ReceiveAddress:     address,
-			Token:              "USDT",
+			Token:              tokenSym,
 			Network:            mdb.NetworkTron,
 			TradeId:            tradeID,
 			Amount:             amount,
@@ -250,7 +316,8 @@ func checkTrc20Transfers(address string, wg *sync.WaitGroup) {
 				log.Sugar.Infof("[TRC20][%s] skip resolved transfer trade_id=%s hash=%s err=%v", address, tradeID, txID, err)
 				continue
 			}
-			panic(err)
+			log.Sugar.Errorf("[TRC20][%s] order processing failed trade_id=%s hash=%s err=%v", address, tradeID, txID, err)
+			continue
 		}
 
 		sendPaymentNotification(order)
@@ -273,7 +340,9 @@ func evmChainLogLabel(chainNetwork string) string {
 	}
 }
 
-// TryProcessEvmERC20Transfer 处理各 EVM 链上 USDT/USDC（及 Polygon USDC.e）的 Transfer 入账（合约与 network 需一致）。
+// TryProcessEvmERC20Transfer 处理各 EVM 链上代币的 Transfer 入账。
+// 代币识别、符号和 decimals 全部从 chain_tokens 表动态查询 —
+// 管理后台新增 token 即可立即生效，无需代码改动。
 func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, toAddr common.Address, rawValue *big.Int, txHash string, blockTsMs int64) {
 	defer func() {
 		if err := recover(); err != nil {
@@ -281,46 +350,38 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 		}
 	}()
 
-	var usdt, usdc common.Address
-	var polygonUsdcE common.Address
-	switch chainNetwork {
-	case mdb.NetworkEthereum:
-		usdt = common.HexToAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7")
-		usdc = common.HexToAddress("0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
-	case mdb.NetworkBsc:
-		usdt = common.HexToAddress("0x55d398326f99059fF775485246999027B3197955")
-		usdc = common.HexToAddress("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d")
-	case mdb.NetworkPolygon:
-		usdt = common.HexToAddress("0xc2132D05D31c914a87C6611C10748AEb04B58e8F")
-		usdc = common.HexToAddress("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
-		polygonUsdcE = common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-	case mdb.NetworkPlasma:
-		// USDT0（官方），6 decimals；链上暂无与 ETH 同级的 Circle USDC 部署，仅匹配 USDT 订单
-		usdt = common.HexToAddress("0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb")
-	default:
-		return
-	}
-
-	var tokenSym string
-	switch {
-	case contract == usdt:
-		tokenSym = "USDT"
-	case contract == usdc || (polygonUsdcE != (common.Address{}) && contract == polygonUsdcE):
-		tokenSym = "USDC"
-	default:
-		net := evmChainLogLabel(chainNetwork)
-		log.Sugar.Warnf("[%s-WS] skip unsupported contract %s", net, contract.Hex())
-		return
-	}
-
 	net := evmChainLogLabel(chainNetwork)
+	token, err := data.GetEnabledChainTokenByContract(chainNetwork, contract.Hex())
+	if err != nil {
+		log.Sugar.Warnf("[%s-WS] chain_tokens lookup err=%v contract=%s", net, err, contract.Hex())
+		return
+	}
+	if token == nil || token.ID == 0 {
+		log.Sugar.Debugf("[%s-WS] skip unconfigured contract %s", net, contract.Hex())
+		return
+	}
+	tokenSym := strings.ToUpper(strings.TrimSpace(token.Symbol))
+	if tokenSym == "" {
+		log.Sugar.Warnf("[%s-WS] chain_token id=%d has empty symbol", net, token.ID)
+		return
+	}
+	decimals := token.Decimals
+	if decimals <= 0 {
+		decimals = 6
+	}
+
 	walletAddr := strings.ToLower(toAddr.Hex())
 	if rawValue == nil || rawValue.Sign() <= 0 {
 		log.Sugar.Infof("[%s-%s][%s] skip non-positive or nil amount", net, tokenSym, walletAddr)
 		return
 	}
+	divisor := decimal.New(1, int32(decimals))
 	decimalQuant := decimal.NewFromBigInt(rawValue, 0)
-	amount := math.MustParsePrecFloat64(decimalQuant.Div(decimal.NewFromInt(1_000_000)).InexactFloat64(), 2)
+	amount := math.MustParsePrecFloat64(decimalQuant.Div(divisor).InexactFloat64(), 2)
+	if token.MinAmount > 0 && amount < token.MinAmount {
+		log.Sugar.Debugf("[%s-%s][%s] skip amount %.2f below min_amount %.2f", net, tokenSym, walletAddr, amount, token.MinAmount)
+		return
+	}
 	if amount <= 0 {
 		log.Sugar.Warnf("[%s-%s][%s] skip non-positive amount %.2f", net, tokenSym, walletAddr, amount)
 		return
@@ -349,6 +410,11 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 	}
 	if strings.ToUpper(strings.TrimSpace(order.Token)) != tokenSym {
 		log.Sugar.Warnf("[%s-%s][%s] skip trade_id=%s token mismatch order=%s", net, tokenSym, walletAddr, tradeID, order.Token)
+		return
+	}
+	if blockTsMs > 0 && blockTsMs < order.CreatedAt.TimestampMilli() {
+		log.Sugar.Warnf("[%s-%s][%s] skip tx %s because block_time_ms=%d is before order created_ms=%d",
+			net, tokenSym, walletAddr, txHash, blockTsMs, order.CreatedAt.TimestampMilli())
 		return
 	}
 
@@ -399,7 +465,7 @@ func sendPaymentNotification(order *mdb.Orders) {
 		order.CreatedAt.ToDateTimeString(),
 		carbon.Now().ToDateTimeString(),
 	)
-	telegram.SendToBot(msg)
+	notify.Dispatch(mdb.NotifyEventPaySuccess, msg)
 }
 
 func networkDisplay(n string) string {

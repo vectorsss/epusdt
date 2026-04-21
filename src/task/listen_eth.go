@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/assimon/luuu/config"
 	"github.com/assimon/luuu/model/data"
 	"github.com/assimon/luuu/model/mdb"
 	"github.com/assimon/luuu/model/service"
@@ -18,15 +19,24 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-var (
+// Transfer 事件签名 — ERC-20 signature, same on every EVM chain.
+var transferEventHash = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
-	// USDT / USDC 合约地址（ETH 主网）
-	usdtContract = common.HexToAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7")
-	usdcContract = common.HexToAddress("0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
+const ethereumDefaultWsURL = "wss://ethereum.publicnode.com"
 
-	// Transfer 事件签名
-	transferEventHash = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
-)
+// resolveEthereumWsURL picks a healthy WS endpoint. Falls back to the
+// legacy .env value (if set) before the shared default — keeps existing
+// deployments working until the admin adds an rpc_nodes row.
+func resolveEthereumWsURL() string {
+	node, err := data.SelectRpcNode(mdb.NetworkEthereum, mdb.RpcNodeTypeWs)
+	if err == nil && node != nil && node.ID > 0 {
+		return node.Url
+	}
+	if u := config.GetEthereumWsUrl(); u != "" {
+		return u
+	}
+	return ethereumDefaultWsURL
+}
 
 type ethRecipientSnapshot struct {
 	addrs map[string]struct{}
@@ -35,47 +45,68 @@ type ethRecipientSnapshot struct {
 var ethWatchedRecipients atomic.Pointer[ethRecipientSnapshot]
 
 func StartEthereumWebSocketListener() {
+	// Wait until the chain is enabled AND at least one token contract
+	// is configured. Polls every 10s so admin-side toggles kick in
+	// without a restart. Once conditions are met we proceed to connect;
+	// if the websocket later drops we exit the loop and rely on the
+	// process-level restart to reconnect (same as before this refactor).
+	for {
+		if data.IsChainEnabled(mdb.NetworkEthereum) {
+			if contracts := loadChainTokenContracts(mdb.NetworkEthereum, "[ETH-WS]"); len(contracts) > 0 {
+				runEthereumListener(contracts)
+			}
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func runEthereumListener(contracts []common.Address) {
+	ctx, cancel := chainEnabledWatchdog(mdb.NetworkEthereum, "[ETH-WS]", chainTokenFingerprint(mdb.NetworkEthereum))
+	defer cancel()
+
 	wallets, err := data.GetAvailableWalletAddressByNetwork(mdb.NetworkEthereum)
 	if err != nil {
-		log.Sugar.Errorf("Failed to get wallet addresses: %v", err)
+		log.Sugar.Errorf("[ETH-WS] Failed to get wallet addresses: %v", err)
 		return
 	}
 	StoreEthRecipientsFromWallets(wallets)
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			w, err := data.GetAvailableWalletAddressByNetwork(mdb.NetworkEthereum)
-			if err != nil {
-				log.Sugar.Warnf("[ETH-WS] refresh wallet addresses: %v", err)
-				continue
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				w, err := data.GetAvailableWalletAddressByNetwork(mdb.NetworkEthereum)
+				if err != nil {
+					log.Sugar.Warnf("[ETH-WS] refresh wallet addresses: %v", err)
+					continue
+				}
+				StoreEthRecipientsFromWallets(w)
 			}
-			StoreEthRecipientsFromWallets(w)
 		}
 	}()
-	wsURL := "wss://ethereum.publicnode.com"
+
+	wsURL := resolveEthereumWsURL()
+	log.Sugar.Infof("[ETH-WS] connecting to %s watching %d contract(s)", wsURL, len(contracts))
+
 	query := ethereum.FilterQuery{
-		Addresses: []common.Address{
-			usdtContract,
-			usdcContract,
-		},
-		Topics: [][]common.Hash{},
+		Addresses: contracts,
+		Topics:    [][]common.Hash{},
 	}
 
-	runEvmWsLogListener("[ETH-WS]", wsURL, query, func(client *ethclient.Client, vLog types.Log) {
+	runEvmWsLogListener(ctx, "[ETH-WS]", wsURL, query, func(client *ethclient.Client, vLog types.Log) {
 		if len(vLog.Topics) < 3 {
 			return
 		}
-
 		event := vLog.Topics[0].String()
 		if event != transferEventHash.String() {
 			return
 		}
 
 		amount := new(big.Int).SetBytes(vLog.Data)
-
 		toAddr := common.HexToAddress(vLog.Topics[2].Hex())
-
 		if !isWatchedEthRecipient(toAddr) {
 			return
 		}
@@ -115,18 +146,3 @@ func isWatchedEthRecipient(to common.Address) bool {
 	return ok
 }
 
-func formatAmount(amount *big.Int, decimals int) string {
-	f := new(big.Float).SetInt(amount)
-	divisor := new(big.Float).SetFloat64(float64Pow(10, decimals))
-	result := new(big.Float).Quo(f, divisor)
-
-	return result.Text('f', 6)
-}
-
-func float64Pow(a, b int) float64 {
-	result := 1.0
-	for i := 0; i < b; i++ {
-		result *= float64(a)
-	}
-	return result
-}

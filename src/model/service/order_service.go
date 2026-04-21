@@ -33,8 +33,28 @@ var (
 	gOrderProcessingLock   sync.Mutex
 )
 
+// apiKeyID safely extracts the primary key from an ApiKey row.
+// Returns 0 when apiKey is nil (middleware didn't run — shouldn't happen on authed routes).
+func apiKeyID(apiKey *mdb.ApiKey) uint64 {
+	if apiKey == nil {
+		return 0
+	}
+	return apiKey.ID
+}
+
+func normalizeOrderAddressByNetwork(network, address string) string {
+	network = strings.ToLower(strings.TrimSpace(network))
+	address = strings.TrimSpace(address)
+	switch network {
+	case mdb.NetworkEthereum, mdb.NetworkBsc, mdb.NetworkPolygon, mdb.NetworkPlasma:
+		return strings.ToLower(address)
+	default:
+		return address
+	}
+}
+
 // CreateTransaction creates a new payment order.
-func CreateTransaction(req *request.CreateTransactionRequest) (*response.CreateTransactionResponse, error) {
+func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey) (*response.CreateTransactionResponse, error) {
 	gCreateTransactionLock.Lock()
 	defer gCreateTransactionLock.Unlock()
 
@@ -64,6 +84,9 @@ func CreateTransaction(req *request.CreateTransactionRequest) (*response.CreateT
 		return nil, constant.OrderAlreadyExists
 	}
 
+	if !data.IsChainEnabled(network) {
+		return nil, constant.ChainNotEnabled
+	}
 	walletAddress, err := data.GetAvailableWalletAddressByNetwork(network)
 	if err != nil {
 		return nil, err
@@ -97,6 +120,7 @@ func CreateTransaction(req *request.CreateTransactionRequest) (*response.CreateT
 		RedirectUrl:    req.RedirectUrl,
 		Name:           req.Name,
 		PaymentType:    req.PaymentType,
+		ApiKeyID:       apiKeyID(apiKey),
 	}
 	if err = data.CreateOrderWithTransaction(tx, order); err != nil {
 		tx.Rollback()
@@ -161,7 +185,7 @@ func OrderProcessing(req *request.OrderProcessingRequest) error {
 	// Load order to check parent-child relationship
 	order, err := data.GetOrderInfoByTradeId(req.TradeId)
 	if err != nil {
-		return nil
+		return fmt.Errorf("load paid order failed, trade_id=%s: %w", req.TradeId, err)
 	}
 
 	// Parent order paid directly: expire all sub-orders and release their locks
@@ -169,7 +193,7 @@ func OrderProcessing(req *request.OrderProcessingRequest) error {
 		subs, subErr := data.GetActiveSubOrders(order.TradeId)
 		if subErr != nil {
 			log.Sugar.Errorf("[order] get sub-orders for parent failed, trade_id=%s, err=%v", order.TradeId, subErr)
-			return nil
+			return fmt.Errorf("load sub-orders failed, parent_trade_id=%s: %w", order.TradeId, subErr)
 		}
 		for _, sub := range subs {
 			if err = data.ExpireOrderByTradeId(sub.TradeId); err != nil {
@@ -182,22 +206,48 @@ func OrderProcessing(req *request.OrderProcessingRequest) error {
 		return nil
 	}
 
-	// Sub-order should not trigger its own callback (notify_url is empty).
-	// OrderSuccessWithTransaction unconditionally sets callback_confirm=No,
-	// reset it here to prevent the callback worker from retrying an empty URL.
-	if err = data.ResetCallbackConfirmOk(order.TradeId); err != nil {
-		log.Sugar.Warnf("[order] reset sub-order callback_confirm failed, trade_id=%s, err=%v", order.TradeId, err)
-	}
-
 	parent, err := data.GetOrderInfoByTradeId(order.ParentTradeId)
 	if err != nil {
 		log.Sugar.Errorf("[order] load parent order failed, parent_trade_id=%s, err=%v", order.ParentTradeId, err)
-		return nil
+		return fmt.Errorf("load parent order failed, parent_trade_id=%s: %w", order.ParentTradeId, err)
 	}
 
+	// Snapshot siblings for lock release after DB state transition commits.
+	siblings, err := data.GetSiblingSubOrders(parent.TradeId, order.TradeId)
+	if err != nil {
+		log.Sugar.Errorf("[order] get sibling sub-orders failed, parent_trade_id=%s, err=%v", parent.TradeId, err)
+		return fmt.Errorf("load sibling sub-orders failed, parent_trade_id=%s: %w", parent.TradeId, err)
+	}
+
+	finalizeTx := dao.Mdb.Begin()
+
 	// Mark parent as paid with sub-order's payment details
-	if _, err = data.MarkParentOrderSuccess(parent.TradeId, order); err != nil {
-		log.Sugar.Errorf("[order] mark parent success failed, parent_trade_id=%s, err=%v", parent.TradeId, err)
+	updatedParent, markErr := data.MarkParentOrderSuccessWithTransaction(finalizeTx, parent.TradeId, order)
+	if markErr != nil {
+		finalizeTx.Rollback()
+		log.Sugar.Errorf("[order] mark parent success failed, parent_trade_id=%s, err=%v", parent.TradeId, markErr)
+		return fmt.Errorf("mark parent success failed, parent_trade_id=%s: %w", parent.TradeId, markErr)
+	}
+	if !updatedParent {
+		finalizeTx.Rollback()
+		return fmt.Errorf("parent order not updated, trade_id=%s is not in wait-pay status", parent.TradeId)
+	}
+
+	if err = data.ExpireSiblingSubOrdersWithTransaction(finalizeTx, parent.TradeId, order.TradeId); err != nil {
+		finalizeTx.Rollback()
+		return fmt.Errorf("expire sibling sub-orders failed, parent_trade_id=%s: %w", parent.TradeId, err)
+	}
+
+	if err = finalizeTx.Commit().Error; err != nil {
+		finalizeTx.Rollback()
+		return fmt.Errorf("commit parent finalize tx failed, parent_trade_id=%s: %w", parent.TradeId, err)
+	}
+
+	// Sub-order should not trigger its own callback (notify_url is empty).
+	// OrderSuccessWithTransaction unconditionally sets callback_confirm=No,
+	// reset it only after the parent order is successfully finalized.
+	if err = data.ResetCallbackConfirmOk(order.TradeId); err != nil {
+		log.Sugar.Warnf("[order] reset sub-order callback_confirm failed, trade_id=%s, err=%v", order.TradeId, err)
 	}
 
 	// Release parent's own wallet lock
@@ -205,16 +255,8 @@ func OrderProcessing(req *request.OrderProcessingRequest) error {
 		log.Sugar.Warnf("[order] unlock parent transaction failed, parent_trade_id=%s, err=%v", parent.TradeId, err)
 	}
 
-	// Expire sibling sub-orders and release their locks
-	siblings, err := data.GetSiblingSubOrders(parent.TradeId, order.TradeId)
-	if err != nil {
-		log.Sugar.Errorf("[order] get sibling sub-orders failed, parent_trade_id=%s, err=%v", parent.TradeId, err)
-		return nil
-	}
+	// Release sibling locks after their status transitions commit.
 	for _, sib := range siblings {
-		if err = data.ExpireOrderByTradeId(sib.TradeId); err != nil {
-			log.Sugar.Warnf("[order] expire sibling failed, trade_id=%s, err=%v", sib.TradeId, err)
-		}
 		if err = data.UnLockTransaction(sib.Network, sib.ReceiveAddress, sib.Token, sib.ActualAmount); err != nil {
 			log.Sugar.Warnf("[order] unlock sibling transaction failed, trade_id=%s, err=%v", sib.TradeId, err)
 		}
@@ -230,9 +272,10 @@ func ReserveAvailableWalletAndAmount(tradeID string, network string, token strin
 
 	tryLockWalletFunc := func(targetAmount float64) (string, error) {
 		for _, address := range walletAddress {
-			err := data.LockTransaction(network, address.Address, token, tradeID, targetAmount, config.GetOrderExpirationTimeDuration())
+			normalizedAddress := normalizeOrderAddressByNetwork(network, address.Address)
+			err := data.LockTransaction(network, normalizedAddress, token, tradeID, targetAmount, config.GetOrderExpirationTimeDuration())
 			if err == nil {
-				return address.Address, nil
+				return normalizedAddress, nil
 			}
 			if errors.Is(err, data.ErrTransactionLocked) {
 				continue
@@ -344,6 +387,9 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 	}
 
 	// 6. Find and lock wallet
+	if !data.IsChainEnabled(network) {
+		return nil, constant.ChainNotEnabled
+	}
 	walletAddress, err := data.GetAvailableWalletAddressByNetwork(network)
 	if err != nil {
 		return nil, err
@@ -381,6 +427,7 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 		Name:            parent.Name,
 		CallBackConfirm: mdb.CallBackConfirmOk, // don't trigger callback on sub-order
 		PaymentType:     parent.PaymentType,
+		ApiKeyID:        parent.ApiKeyID, // inherit from parent so resolveOrderApiKey never fails
 	}
 	if err = data.CreateOrderWithTransaction(tx, subOrder); err != nil {
 		tx.Rollback()

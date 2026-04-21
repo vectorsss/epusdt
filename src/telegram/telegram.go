@@ -1,66 +1,120 @@
 package telegram
 
 import (
-	"github.com/assimon/luuu/config"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/assimon/luuu/model/data"
 	"github.com/assimon/luuu/util/log"
 	tb "gopkg.in/telebot.v3"
 	"gopkg.in/telebot.v3/middleware"
-	"time"
 )
 
-var bots *tb.Bot
+// bots is the single bot instance backing slash-command handlers
+// (/start, WalletList, add-wallet dialog). Config is read from the
+// settings table (system.telegram_bot_token + system.telegram_chat_id).
+// Decoupled from notification_channels — that table drives push
+// notifications only (via notify/dispatcher.go).
+var (
+	bots        *tb.Bot
+	adminChatID int64
+	reloadMu    sync.Mutex
+)
 
-// BotStart 机器人启动
+// BotStart connects the command bot. If no telegram channel is
+// configured yet it logs and returns; the service otherwise runs fine
+// and notifications still fan out as soon as a channel is added (those
+// use their own per-request bot; see notify/telegram_sender.go).
 func BotStart() {
-	var err error
+	if err := reloadBot("bootstrap"); err != nil {
+		log.Sugar.Errorf("[telegram] bot start failed: %v", err)
+	}
+}
+
+// ReloadBotAsync refreshes the command bot from notification_channels.
+// It is used by admin API handlers after telegram channel create/update/
+// status/delete so operators don't need to restart the service.
+func ReloadBotAsync(reason string) {
+	go func() {
+		if err := reloadBot(reason); err != nil {
+			log.Sugar.Errorf("[telegram] reload failed, reason=%s err=%v", reason, err)
+		}
+	}()
+}
+
+// loadCommandBotConfig reads the command-bot config from the settings
+// table (system.telegram_bot_token + system.telegram_chat_id).
+// Returns (nil, "", nil) when the keys are absent so the caller can
+// log and return gracefully — bot stays disabled until settings are set.
+func loadCommandBotConfig() (*botConfig, string, error) {
+	botToken := strings.TrimSpace(data.GetSettingString("system.telegram_bot_token", ""))
+	chatIDStr := strings.TrimSpace(data.GetSettingString("system.telegram_chat_id", ""))
+	if botToken == "" || chatIDStr == "" {
+		return nil, "", nil
+	}
+	chatID, err := strconv.ParseInt(chatIDStr, 10, 64)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid telegram chat_id in settings: %w", err)
+	}
+	return &botConfig{BotToken: botToken, ChatID: chatID}, "settings", nil
+}
+
+// botConfig holds the minimal fields needed to start the command bot.
+type botConfig struct {
+	BotToken string
+	ChatID   int64
+}
+
+func reloadBot(reason string) error {
+	reloadMu.Lock()
+	defer reloadMu.Unlock()
+
+	if bots != nil {
+		bots.Stop()
+		bots = nil
+	}
+
+	cfg, source, err := loadCommandBotConfig()
+	if err != nil {
+		return err
+	}
+	if cfg == nil {
+		log.Sugar.Infof("[telegram] no enabled telegram channel configured; command bot disabled (reason=%s)", reason)
+		return nil
+	}
+	adminChatID = cfg.ChatID
+
 	botSetting := tb.Settings{
-		Token:       config.TgBotToken,
+		Token:       cfg.BotToken,
 		Poller:      &tb.LongPoller{Timeout: 50 * time.Second},
 		Synchronous: true,
 	}
-	if config.TgProxy != "" {
-		botSetting.URL = config.TgProxy
-	}
-	bots, err = tb.NewBot(botSetting)
+	newBot, err := tb.NewBot(botSetting)
 	if err != nil {
-		log.Sugar.Error(err.Error())
-		return
+		return fmt.Errorf("new bot: %w", err)
 	}
-	err = bots.SetCommands(Cmds)
-	if err != nil {
-		log.Sugar.Error(err.Error())
-		return
+	if err = newBot.SetCommands(Cmds); err != nil {
+		return fmt.Errorf("set commands: %w", err)
 	}
+	bots = newBot
 	RegisterHandle()
-	bots.Start()
+	go bots.Start()
+
+	log.Sugar.Infof("[telegram] command bot started, reason=%s, source=%s", reason, source)
+	return nil
 }
 
-// RegisterHandle 注册处理器
+// RegisterHandle wires slash-command and text-message routes. The
+// admin whitelist uses the chat_id from the same channel row.
 func RegisterHandle() {
+	if bots == nil {
+		return
+	}
 	adminOnly := bots.Group()
-	adminOnly.Use(middleware.Whitelist(config.TgManage))
+	adminOnly.Use(middleware.Whitelist(adminChatID))
 	adminOnly.Handle(START_CMD, WalletList)
 	adminOnly.Handle(tb.OnText, OnTextMessageHandle)
-}
-
-// SendToBot 主动发送消息机器人消息
-func SendToBot(msg string) {
-	go func() {
-		if bots == nil {
-			log.Sugar.Error("[Telegram] bots实例为nil，无法发送消息")
-			return
-		}
-		user := tb.User{
-			ID: config.TgManage,
-		}
-		log.Sugar.Infof("[Telegram] 正在发送消息给用户ID=%d", config.TgManage)
-		_, err := bots.Send(&user, msg, &tb.SendOptions{
-			ParseMode: tb.ModeHTML,
-		})
-		if err != nil {
-			log.Sugar.Errorf("[Telegram] 发送消息失败: userID=%d, err=%v", config.TgManage, err)
-		} else {
-			log.Sugar.Infof("[Telegram] 发送消息成功: userID=%d", config.TgManage)
-		}
-	}()
 }

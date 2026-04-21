@@ -27,7 +27,6 @@ func SetupTestDatabases(t testing.TB) func() {
 	viper.Set("callback_retry_base_seconds", 1)
 	viper.Set("queue_concurrency", 4)
 	viper.Set("queue_poll_interval_ms", 50)
-	viper.Set("api_auth_token", "test-token")
 
 	config.HTTPAccessLog = false
 	config.SQLDebug = false
@@ -38,11 +37,43 @@ func SetupTestDatabases(t testing.TB) func() {
 	mainDB := mustOpenSQLite(t, filepath.Join(t.TempDir(), "main.db"))
 	runtimeDB := mustOpenSQLite(t, filepath.Join(t.TempDir(), "runtime.db"))
 
-	mustMigrate(t, mainDB, &mdb.Orders{}, &mdb.WalletAddress{})
+	mustMigrate(t, mainDB,
+		&mdb.Orders{},
+		&mdb.WalletAddress{},
+		&mdb.ApiKey{},
+		&mdb.Setting{},
+		&mdb.NotificationChannel{},
+		&mdb.Chain{},
+		&mdb.ChainToken{},
+		&mdb.RpcNode{},
+		&mdb.AdminUser{},
+	)
 	mustMigrate(t, runtimeDB, &mdb.TransactionLock{})
 
 	dao.Mdb = mainDB
 	dao.RuntimeDB = runtimeDB
+
+	// Seed all standard chains as enabled so IsChainEnabled checks pass.
+	for _, network := range []string{
+		mdb.NetworkTron, mdb.NetworkSolana, mdb.NetworkEthereum,
+		mdb.NetworkBsc, mdb.NetworkPolygon, mdb.NetworkPlasma,
+	} {
+		mainDB.Create(&mdb.Chain{Network: network, Enabled: true})
+	}
+
+	// Seed two universal api_keys rows. Both usable for EPAY/GMPAY
+	// flows; the numeric PID 1001 row lets legacy tests that submit
+	// `pid=1001` still match.
+	mainDB.Create(&mdb.ApiKey{
+		Name: "test-default",
+		Pid:  "test-token", SecretKey: "test-token",
+		Status: mdb.ApiKeyStatusEnable,
+	})
+	mainDB.Create(&mdb.ApiKey{
+		Name: "test-pid-1001",
+		Pid:  "1001", SecretKey: "test-token",
+		Status: mdb.ApiKeyStatusEnable,
+	})
 
 	return func() {
 		closeDB(t, runtimeDB)

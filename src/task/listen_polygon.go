@@ -18,12 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-var (
-	// Polygon PoS 主网 USDT / USDC（原生）/ USDC.e（桥接）
-	polygonUsdtContract  = common.HexToAddress("0xc2132D05D31c914a87C6611C10748AEb04B58e8F")
-	polygonUsdcContract  = common.HexToAddress("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
-	polygonUsdcEContract = common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-)
+const polygonDefaultWsURL = "wss://polygon-bor-rpc.publicnode.com"
 
 type polygonRecipientSnapshot struct {
 	addrs map[string]struct{}
@@ -31,7 +26,23 @@ type polygonRecipientSnapshot struct {
 
 var polygonWatchedRecipients atomic.Pointer[polygonRecipientSnapshot]
 
+// StartPolygonWebSocketListener drives the Polygon listener with
+// dynamic chain/token config reload every 10s.
 func StartPolygonWebSocketListener() {
+	for {
+		if data.IsChainEnabled(mdb.NetworkPolygon) {
+			if contracts := loadChainTokenContracts(mdb.NetworkPolygon, "[POLYGON-WS]"); len(contracts) > 0 {
+				runPolygonListener(contracts)
+			}
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func runPolygonListener(contracts []common.Address) {
+	ctx, cancel := chainEnabledWatchdog(mdb.NetworkPolygon, "[POLYGON-WS]", chainTokenFingerprint(mdb.NetworkPolygon))
+	defer cancel()
+
 	wallets, err := data.GetAvailableWalletAddressByNetwork(mdb.NetworkPolygon)
 	if err != nil {
 		log.Sugar.Errorf("[POLYGON-WS] Failed to get wallet addresses: %v", err)
@@ -41,26 +52,30 @@ func StartPolygonWebSocketListener() {
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			w, err := data.GetAvailableWalletAddressByNetwork(mdb.NetworkPolygon)
-			if err != nil {
-				log.Sugar.Warnf("[POLYGON-WS] refresh wallet addresses: %v", err)
-				continue
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				w, err := data.GetAvailableWalletAddressByNetwork(mdb.NetworkPolygon)
+				if err != nil {
+					log.Sugar.Warnf("[POLYGON-WS] refresh wallet addresses: %v", err)
+					continue
+				}
+				storePolygonRecipientsFromWallets(w)
 			}
-			storePolygonRecipientsFromWallets(w)
 		}
 	}()
-	wsURL := "wss://polygon-bor-rpc.publicnode.com"
+
+	wsURL := resolveChainWsURL(mdb.NetworkPolygon, polygonDefaultWsURL)
+	log.Sugar.Infof("[POLYGON-WS] connecting to %s watching %d contract(s)", wsURL, len(contracts))
+
 	query := ethereum.FilterQuery{
-		Addresses: []common.Address{
-			polygonUsdtContract,
-			polygonUsdcContract,
-			polygonUsdcEContract,
-		},
-		Topics: [][]common.Hash{},
+		Addresses: contracts,
+		Topics:    [][]common.Hash{},
 	}
 
-	runEvmWsLogListener("[POLYGON-WS]", wsURL, query, func(client *ethclient.Client, vLog types.Log) {
+	runEvmWsLogListener(ctx, "[POLYGON-WS]", wsURL, query, func(client *ethclient.Client, vLog types.Log) {
 		if len(vLog.Topics) < 3 {
 			return
 		}

@@ -17,6 +17,10 @@ func (r ListenTrc20Job) Run() {
 	gListenTrc20JobLock.Lock()
 	defer gListenTrc20JobLock.Unlock()
 	log.Sugar.Debug("[ListenTrc20Job] Job triggered")
+	if !data.IsChainEnabled(mdb.NetworkTron) {
+		log.Sugar.Debug("[ListenTrc20Job] chain disabled, skipping")
+		return
+	}
 	walletAddress, err := data.GetAvailableWalletAddressByNetwork(mdb.NetworkTron)
 	if err != nil {
 		log.Sugar.Errorf("[ListenTrc20Job] Failed to get wallet addresses: %v", err)

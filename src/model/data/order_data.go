@@ -28,8 +28,29 @@ func normalizeLockAmount(amount float64) (int64, string) {
 	return value.Shift(2).IntPart(), value.StringFixed(2)
 }
 
+func normalizeLockNetwork(network string) string {
+	return strings.ToLower(strings.TrimSpace(network))
+}
+
+func normalizeLockAddress(network, address string) string {
+	address = strings.TrimSpace(address)
+	if isEVMNetwork(normalizeLockNetwork(network)) {
+		return strings.ToLower(address)
+	}
+	return address
+}
+
 func normalizeLockToken(token string) string {
 	return strings.ToUpper(strings.TrimSpace(token))
+}
+
+func applyLockAddressFilter(tx *gorm.DB, network, address string) *gorm.DB {
+	network = normalizeLockNetwork(network)
+	address = normalizeLockAddress(network, address)
+	if isEVMNetwork(network) {
+		return tx.Where("lower(address) = ?", address)
+	}
+	return tx.Where("address = ?", address)
 }
 
 // GetOrderInfoByOrderId fetches an order by merchant order id.
@@ -142,20 +163,36 @@ func GetSiblingSubOrders(parentTradeId string, excludeTradeId string) ([]mdb.Ord
 	return orders, err
 }
 
-// MarkParentOrderSuccess updates the parent order with the sub-order's payment details.
-// Token and network are NOT overwritten — the parent keeps its original values.
+// MarkParentOrderSuccess marks the parent order as paid and records which sub-order
+// settled it. Only the status, callback_confirm, and pay_by_sub_id fields are updated;
+// the parent's own block_transaction_id, actual_amount, and receive_address are
+// intentionally left unchanged because the parent was not directly paid.
 func MarkParentOrderSuccess(parentTradeId string, sub *mdb.Orders) (bool, error) {
-	result := dao.Mdb.Model(&mdb.Orders{}).
+	return MarkParentOrderSuccessWithTransaction(dao.Mdb, parentTradeId, sub)
+}
+
+// MarkParentOrderSuccessWithTransaction is the transactional variant of
+// MarkParentOrderSuccess.
+func MarkParentOrderSuccessWithTransaction(tx *gorm.DB, parentTradeId string, sub *mdb.Orders) (bool, error) {
+	result := tx.Model(&mdb.Orders{}).
 		Where("trade_id = ?", parentTradeId).
 		Where("status = ?", mdb.StatusWaitPay).
 		Updates(map[string]interface{}{
-			"status":               mdb.StatusPaySuccess,
-			"block_transaction_id": sub.BlockTransactionId,
-			"callback_confirm":     mdb.CallBackConfirmNo,
-			"actual_amount":        sub.ActualAmount,
-			"receive_address":      sub.ReceiveAddress,
+			"status":           mdb.StatusPaySuccess,
+			"callback_confirm": mdb.CallBackConfirmNo,
+			"pay_by_sub_id":    sub.ID,
 		})
 	return result.RowsAffected > 0, result.Error
+}
+
+// ExpireSiblingSubOrdersWithTransaction expires all waiting sibling
+// sub-orders under the same parent in one statement.
+func ExpireSiblingSubOrdersWithTransaction(tx *gorm.DB, parentTradeId string, excludeTradeId string) error {
+	return tx.Model(&mdb.Orders{}).
+		Where("parent_trade_id = ?", parentTradeId).
+		Where("trade_id != ?", excludeTradeId).
+		Where("status = ?", mdb.StatusWaitPay).
+		Update("status", mdb.StatusExpired).Error
 }
 
 // MarkOrderSelected sets is_selected=true for the given trade_id.
@@ -191,6 +228,32 @@ func GetActiveSubOrders(parentTradeId string) ([]mdb.Orders, error) {
 	return orders, err
 }
 
+// GetAllSubOrders returns all sub-orders (any status) under a parent order,
+// ordered by creation time ascending.
+func GetAllSubOrders(parentTradeId string) ([]mdb.Orders, error) {
+	var orders []mdb.Orders
+	err := dao.Mdb.Model(&mdb.Orders{}).
+		Where("parent_trade_id = ?", parentTradeId).
+		Order("created_at ASC").
+		Find(&orders).Error
+	return orders, err
+}
+
+// GetSubOrdersByParentTradeIds batch-fetches all sub-orders (any status)
+// whose parent_trade_id is in the given set. Ordered by parent_trade_id
+// then created_at ASC so callers can build a grouped map in one pass.
+func GetSubOrdersByParentTradeIds(parentTradeIds []string) ([]mdb.Orders, error) {
+	if len(parentTradeIds) == 0 {
+		return nil, nil
+	}
+	var orders []mdb.Orders
+	err := dao.Mdb.Model(&mdb.Orders{}).
+		Where("parent_trade_id IN ?", parentTradeIds).
+		Order("parent_trade_id ASC, created_at ASC").
+		Find(&orders).Error
+	return orders, err
+}
+
 // ExpireOrderByTradeId marks a single order as expired if still waiting.
 func ExpireOrderByTradeId(tradeId string) error {
 	return dao.Mdb.Model(&mdb.Orders{}).
@@ -201,16 +264,17 @@ func ExpireOrderByTradeId(tradeId string) error {
 
 // GetTradeIdByWalletAddressAndAmountAndToken resolves the reserved trade id by network, address, token and amount.
 func GetTradeIdByWalletAddressAndAmountAndToken(network string, address string, token string, amount float64) (string, error) {
+	network = normalizeLockNetwork(network)
+	address = normalizeLockAddress(network, address)
 	scaledAmount, _ := normalizeLockAmount(amount)
 	var lock mdb.TransactionLock
-	err := dao.RuntimeDB.Model(&mdb.TransactionLock{}).
+	query := dao.RuntimeDB.Model(&mdb.TransactionLock{}).
 		Where("network = ?", network).
-		Where("address = ?", address).
 		Where("token = ?", normalizeLockToken(token)).
 		Where("amount_scaled = ?", scaledAmount).
-		Where("expires_at > ?", time.Now()).
-		Limit(1).
-		Find(&lock).Error
+		Where("expires_at > ?", time.Now())
+	query = applyLockAddressFilter(query, network, address)
+	err := query.Limit(1).Find(&lock).Error
 	if err != nil {
 		return "", err
 	}
@@ -222,6 +286,8 @@ func GetTradeIdByWalletAddressAndAmountAndToken(network string, address string, 
 
 // LockTransaction reserves a network+address+token+amount pair in sqlite until expiration.
 func LockTransaction(network, address, token, tradeID string, amount float64, expirationTime time.Duration) error {
+	network = normalizeLockNetwork(network)
+	address = normalizeLockAddress(network, address)
 	scaledAmount, amountText := normalizeLockAmount(amount)
 	normalizedToken := normalizeLockToken(token)
 	now := time.Now()
@@ -236,12 +302,12 @@ func LockTransaction(network, address, token, tradeID string, amount float64, ex
 	}
 
 	return dao.RuntimeDB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("network = ?", network).
-			Where("address = ?", address).
+		expiredQuery := tx.Where("network = ?", network).
 			Where("token = ?", normalizedToken).
 			Where("amount_scaled = ?", scaledAmount).
-			Where("expires_at <= ?", now).
-			Delete(&mdb.TransactionLock{}).Error; err != nil {
+			Where("expires_at <= ?", now)
+		expiredQuery = applyLockAddressFilter(expiredQuery, network, address)
+		if err := expiredQuery.Delete(&mdb.TransactionLock{}).Error; err != nil {
 			return err
 		}
 		if err := tx.Where("trade_id = ?", tradeID).Delete(&mdb.TransactionLock{}).Error; err != nil {
@@ -261,13 +327,15 @@ func LockTransaction(network, address, token, tradeID string, amount float64, ex
 
 // UnLockTransaction releases the reservation for network+address+token+amount.
 func UnLockTransaction(network string, address string, token string, amount float64) error {
+	network = normalizeLockNetwork(network)
+	address = normalizeLockAddress(network, address)
 	scaledAmount, _ := normalizeLockAmount(amount)
-	return dao.RuntimeDB.
+	query := dao.RuntimeDB.
 		Where("network = ?", network).
-		Where("address = ?", address).
 		Where("token = ?", normalizeLockToken(token)).
-		Where("amount_scaled = ?", scaledAmount).
-		Delete(&mdb.TransactionLock{}).Error
+		Where("amount_scaled = ?", scaledAmount)
+	query = applyLockAddressFilter(query, network, address)
+	return query.Delete(&mdb.TransactionLock{}).Error
 }
 
 func UnLockTransactionByTradeId(tradeID string) error {

@@ -17,6 +17,10 @@ func (r ListenSolJob) Run() {
 	gListenSolJobLock.Lock()
 	defer gListenSolJobLock.Unlock()
 	log.Sugar.Debug("[ListenSolJob] Job triggered")
+	if !data.IsChainEnabled(mdb.NetworkSolana) {
+		log.Sugar.Debug("[ListenSolJob] chain disabled, skipping")
+		return
+	}
 	walletAddress, err := data.GetAvailableWalletAddressByNetwork(mdb.NetworkSolana)
 	if err != nil {
 		log.Sugar.Errorf("[ListenSolJob] Failed to get wallet addresses: %v", err)

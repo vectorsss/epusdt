@@ -122,7 +122,9 @@ func WalletList(c tb.Context) error {
 			InlineKeyboard: rows,
 		})
 	})
-	btnList = append(btnList, []tb.InlineButton{addBtn})
+	refreshBtn := tb.InlineButton{Text: "刷新列表", Unique: "WalletRefresh"}
+	bots.Handle(&refreshBtn, WalletList)
+	btnList = append(btnList, []tb.InlineButton{addBtn, refreshBtn})
 
 	return c.EditOrSend("请选择钱包继续操作", &tb.ReplyMarkup{
 		InlineKeyboard: btnList,
@@ -257,21 +259,15 @@ func getPendingWalletAddressState(userID int64) (pendingWalletAddressState, bool
 }
 
 func getEnabledSupportedNetworks() ([]string, error) {
-	assets, err := data.ListEnabledSupportedAssets()
+	chains, err := data.ListEnabledChains()
 	if err != nil {
 		return nil, err
 	}
-	set := make(map[string]struct{})
-	for _, a := range assets {
-		n := strings.ToLower(strings.TrimSpace(a.Network))
-		if n == "" {
-			continue
+	networks := make([]string, 0, len(chains))
+	for _, ch := range chains {
+		if n := strings.ToLower(strings.TrimSpace(ch.Network)); n != "" {
+			networks = append(networks, n)
 		}
-		set[n] = struct{}{}
-	}
-	networks := make([]string, 0, len(set))
-	for n := range set {
-		networks = append(networks, n)
 	}
 	sort.Strings(networks)
 	return networks, nil

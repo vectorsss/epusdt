@@ -4,16 +4,16 @@ import "github.com/gookit/validate"
 
 // CreateTransactionRequest 创建交易请求
 type CreateTransactionRequest struct {
-	OrderId     string  `json:"order_id" validate:"required|maxLen:32"`
-	Currency    string  `json:"currency" validate:"required"` // 法币 如：cny
-	Token       string  `json:"token" validate:"required"`    // 币种 如：usdt
-	Network     string  `json:"network" validate:"required"`  // 网络 如：TRON
-	Amount      float64 `json:"amount" validate:"required|isFloat|gt:0.01"`
-	NotifyUrl   string  `json:"notify_url" validate:"required"`
-	Signature   string  `json:"signature"  validate:"required"`
-	RedirectUrl string  `json:"redirect_url"`
-	Name        string  `json:"name"`
-	PaymentType string  `json:"payment_type"`
+	OrderId     string  `json:"order_id" form:"order_id" validate:"required|maxLen:32" example:"ORD20260416001"`
+	Currency    string  `json:"currency" form:"currency" validate:"required" example:"cny"` // 法币 如：cny
+	Token       string  `json:"token" form:"token" validate:"required" example:"usdt"`      // 币种 如：usdt
+	Network     string  `json:"network" form:"network" validate:"required" example:"tron"`  // 网络 如：tron
+	Amount      float64 `json:"amount" form:"amount" validate:"required|isFloat|gt:0.01" example:"100.00"`
+	NotifyUrl   string  `json:"notify_url" form:"notify_url" validate:"required" example:"https://example.com/notify"`
+	Signature   string  `json:"signature" form:"signature" validate:"required" example:"a1b2c3d4e5f6..."`
+	RedirectUrl string  `json:"redirect_url" form:"redirect_url" example:"https://example.com/success"`
+	Name        string  `json:"name" form:"name" example:"VIP月卡"`
+	PaymentType string  `json:"payment_type" form:"payment_type" example:"Epay"`
 }
 
 func (r CreateTransactionRequest) Translates() map[string]string {
@@ -41,9 +41,9 @@ type OrderProcessingRequest struct {
 
 // SwitchNetworkRequest 切换支付网络
 type SwitchNetworkRequest struct {
-	TradeId string `json:"trade_id" validate:"required"`
-	Token   string `json:"token" validate:"required"`
-	Network string `json:"network" validate:"required"`
+	TradeId string `json:"trade_id" validate:"required" example:"T2026041612345678"`
+	Token   string `json:"token" validate:"required" example:"USDT"`
+	Network string `json:"network" validate:"required" example:"ethereum"`
 }
 
 func (r SwitchNetworkRequest) Translates() map[string]string {

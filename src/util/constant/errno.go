@@ -16,8 +16,8 @@ var Errno = map[int]string{
 	10011: "exceeded maximum sub-order limit",
 	10012: "cannot switch network on a sub-order",
 	10013: "order is not awaiting payment",
-	10014: "supported asset already exists",
-	10015: "supported asset not found",
+	10014: "chain is not enabled",
+	10016: "supported asset not found",
 }
 
 var (
@@ -36,8 +36,8 @@ var (
 	SubOrderLimitExceeded      = Err(10011)
 	CannotSwitchSubOrder       = Err(10012)
 	OrderNotWaitPay            = Err(10013)
-	SupportedAssetAlreadyExists = Err(10014)
-	SupportedAssetNotFound      = Err(10015)
+	ChainNotEnabled            = Err(10014)
+	SupportedAssetNotFound     = Err(10016)
 )
 
 type RspError struct {
@@ -59,4 +59,20 @@ func Err(code int) (err error) {
 
 func (re *RspError) Render() (code int, msg string) {
 	return re.Code, re.Msg
+}
+
+// HttpStatus maps a RspError code to the HTTP status the handler
+// should use on the wire. Small codes (< 1000) are treated as real
+// HTTP status codes (e.g. 400 system error, 401 signature failure) so
+// clients see the right status. Business codes (>= 1000) are all
+// client-side problems that map to HTTP 400; the specific code still
+// lives in the body's `status_code` field for the frontend to branch on.
+func (re *RspError) HttpStatus() int {
+	if re == nil {
+		return 500
+	}
+	if re.Code >= 400 && re.Code < 600 {
+		return re.Code
+	}
+	return 400
 }
