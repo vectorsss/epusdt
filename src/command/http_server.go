@@ -72,6 +72,9 @@ func HttpServerStart() {
 		}
 	}
 	e.Use(echoMiddleware.StaticWithConfig(echoMiddleware.StaticConfig{
+		Skipper: func(c echo.Context) bool {
+			return luluHttp.ShouldSkipSPAFallback(c.Request().URL.Path)
+		},
 		HTML5: true,
 		Index: "index.html",
 		Root:  wwwRoot,
