@@ -1,7 +1,7 @@
 # Epusdt — Easy Payment USDT
 
 <p align="center">
-  <img src="wiki/img/usdtlogo.png" alt="Epusdt Logo - Multi-chain Crypto Payment Gateway" width="120">
+  <img src="https://gmwallet.app/favicon.png" alt="Epusdt Logo - Multi-chain Crypto Payment Gateway" width="120">
 </p>
 
 <p align="center">
