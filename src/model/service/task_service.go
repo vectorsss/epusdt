@@ -195,69 +195,40 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 		}
 	}()
 
-	var usdt, usdc common.Address
-	var polygonUsdcE common.Address
-	switch chainNetwork {
-	case mdb.NetworkEthereum:
-		usdt = common.HexToAddress("0xdAC17F958D2ee523a2206206994597C13D831ec7")
-		usdc = common.HexToAddress("0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
-	case mdb.NetworkBsc:
-		usdt = common.HexToAddress("0x55d398326f99059fF775485246999027B3197955")
-		usdc = common.HexToAddress("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d")
-	case mdb.NetworkPolygon:
-		usdt = common.HexToAddress("0xc2132D05D31c914a87C6611C10748AEb04B58e8F")
-		usdc = common.HexToAddress("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
-		polygonUsdcE = common.HexToAddress("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-	case mdb.NetworkPlasma:
-		// USDT0（官方），6 decimals；链上暂无与 ETH 同级的 Circle USDC 部署，仅匹配 USDT 订单
-		usdt = common.HexToAddress("0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb")
-	default:
-		return
-	}
-
-	var tokenSym string
-	switch {
-	case contract == usdt:
-		tokenSym = "USDT"
-	case contract == usdc || (polygonUsdcE != (common.Address{}) && contract == polygonUsdcE):
-		tokenSym = "USDC"
-	default:
-		net := evmChainLogLabel(chainNetwork)
-		log.Sugar.Warnf("[%s-WS] skip unsupported contract %s", net, contract.Hex())
-		return
-	}
-
 	net := evmChainLogLabel(chainNetwork)
+	tokenConfig, err := data.GetEnabledChainTokenByContract(chainNetwork, contract.Hex())
+	if err != nil {
+		log.Sugar.Warnf("[%s-WS] load chain token contract=%s: %v", net, contract.Hex(), err)
+		return
+	}
+	if tokenConfig == nil || tokenConfig.ID == 0 {
+		log.Sugar.Warnf("[%s-WS] skip unconfigured contract %s", net, contract.Hex())
+		return
+	}
+	tokenSym := strings.ToUpper(strings.TrimSpace(tokenConfig.Symbol))
+	if tokenSym == "" {
+		log.Sugar.Warnf("[%s-WS] skip contract %s with empty token symbol", net, contract.Hex())
+		return
+	}
 	walletAddr := strings.ToLower(toAddr.Hex())
 	if rawValue == nil || rawValue.Sign() <= 0 {
 		log.Sugar.Infof("[%s-%s][%s] skip non-positive or nil amount", net, tokenSym, walletAddr)
 		return
 	}
-
-	chainTokens, err := data.ListChainTokens(chainNetwork)
-	if err != nil {
-		log.Sugar.Warnf("[%s-%s] load chain tokens: %v", net, tokenSym, err)
-		return
+	decimals := tokenConfig.Decimals
+	if decimals < 0 {
+		decimals = 0
 	}
-	var tokenConfig *mdb.ChainToken
-	for _, t := range chainTokens {
-		if strings.EqualFold(t.Symbol, tokenSym) {
-			tokenConfig = &t
-			break
-		}
-	}
-	if tokenConfig == nil || !tokenConfig.Enabled {
-		log.Sugar.Warnf("[%s-%s] token not enabled or configured in chain_tokens", net, tokenSym)
-		return
-	}
-
-	pow := decimal.New(1, int32(tokenConfig.Decimals))
-	log.Sugar.Warnf("tokenConfig.Decimals %d pow %s", tokenConfig.Decimals, pow.String())
+	pow := decimal.New(1, int32(decimals))
 
 	decimalQuant := decimal.NewFromBigInt(rawValue, 0)
 	amount := math.MustParsePrecFloat64(decimalQuant.Div(pow).InexactFloat64(), 2)
 	if amount <= 0 {
 		log.Sugar.Warnf("[%s-%s][%s] skip non-positive amount %.2f", net, tokenSym, walletAddr, amount)
+		return
+	}
+	if tokenConfig.MinAmount > 0 && amount < tokenConfig.MinAmount {
+		log.Sugar.Debugf("[%s-%s][%s] skip below min amount hash=%s amount=%.2f min=%.2f", net, tokenSym, walletAddr, txHash, amount, tokenConfig.MinAmount)
 		return
 	}
 

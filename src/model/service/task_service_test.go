@@ -1,14 +1,17 @@
 package service
 
 import (
+	"math/big"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/GMWalletApp/epusdt/internal/testutil"
 	"github.com/GMWalletApp/epusdt/model/dao"
+	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/notify"
+	"github.com/ethereum/go-ethereum/common"
 )
 
 func TestSendPaymentNotificationUsesLatestOrderUpdatedAt(t *testing.T) {
@@ -75,5 +78,69 @@ func TestSendPaymentNotificationUsesLatestOrderUpdatedAt(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for notification")
+	}
+}
+
+func TestTryProcessEvmERC20TransferUsesChainTokenContract(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	const (
+		tradeID  = "T202605110001"
+		orderID  = "ORD202605110001"
+		tokenSym = "FOO"
+		amount   = 12.34
+	)
+	contract := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	receiveAddress := common.HexToAddress("0x2222222222222222222222222222222222222222")
+
+	if err := dao.Mdb.Create(&mdb.ChainToken{
+		Network:         mdb.NetworkEthereum,
+		Symbol:          tokenSym,
+		ContractAddress: contract.Hex(),
+		Decimals:        8,
+		Enabled:         true,
+	}).Error; err != nil {
+		t.Fatalf("seed chain token: %v", err)
+	}
+
+	order := &mdb.Orders{
+		TradeId:        tradeID,
+		OrderId:        orderID,
+		Amount:         100,
+		Currency:       "CNY",
+		ActualAmount:   amount,
+		Token:          tokenSym,
+		Network:        mdb.NetworkEthereum,
+		ReceiveAddress: strings.ToLower(receiveAddress.Hex()),
+		Status:         mdb.StatusWaitPay,
+	}
+	if err := dao.Mdb.Create(order).Error; err != nil {
+		t.Fatalf("seed order: %v", err)
+	}
+	if err := data.LockTransaction(mdb.NetworkEthereum, order.ReceiveAddress, order.Token, order.TradeId, order.ActualAmount, time.Hour); err != nil {
+		t.Fatalf("lock transaction: %v", err)
+	}
+
+	rawValue := big.NewInt(1_234_000_000) // 12.34 with 8 decimals
+	TryProcessEvmERC20Transfer(mdb.NetworkEthereum, contract, receiveAddress, rawValue, "0xfoo-hash", time.Now().UnixMilli())
+
+	paid, err := data.GetOrderInfoByTradeId(tradeID)
+	if err != nil {
+		t.Fatalf("load paid order: %v", err)
+	}
+	if paid.Status != mdb.StatusPaySuccess {
+		t.Fatalf("order status = %d, want %d", paid.Status, mdb.StatusPaySuccess)
+	}
+	if paid.BlockTransactionId != "0xfoo-hash" {
+		t.Fatalf("block transaction id = %q, want %q", paid.BlockTransactionId, "0xfoo-hash")
+	}
+
+	lockTradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkEthereum, receiveAddress.Hex(), tokenSym, amount)
+	if err != nil {
+		t.Fatalf("lookup released lock: %v", err)
+	}
+	if lockTradeID != "" {
+		t.Fatalf("runtime lock still exists for trade_id=%q", lockTradeID)
 	}
 }
