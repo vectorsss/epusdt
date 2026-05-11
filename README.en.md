@@ -64,8 +64,6 @@ No matter what kind of platform you operate, Epusdt can fit into existing paymen
 | **Epay-Compatible Flow** | Works with platforms already using Epay-style payment interfaces |
 | **More** | Simple HTTP API, often integrated within 10 minutes |
 
-See more integrations and plugins here: [plugins/](./plugins/)
-
 ---
 
 ## Core Features
@@ -100,10 +98,7 @@ Quick-start links:
 
 ```text
 Epusdt
-├── plugins/    Integrated plugins and platform adapters
 ├── src/        Core project source code
-├── sdk/        Integration SDKs
-├── sql/        Database install / upgrade scripts
 └── wiki/       Documentation assets and knowledge base
 ```
 

@@ -64,8 +64,6 @@
 | **Epay 兼容** | 兼容各类支持 Epay 易支付接口的平台 |
 | **更多** | 简易 HTTP API，10 分钟内接入 |
 
-查看更多集成列表与插件：[plugins/](./plugins/)
-
 ---
 
 ## 核心特性
@@ -100,10 +98,7 @@
 
 ```text
 Epusdt
-├── plugins/    已集成的系统插件（独角数卡等）
 ├── src/        项目核心代码
-├── sdk/        接入 SDK
-├── sql/        数据库安装 / 升级脚本
 └── wiki/       文档与知识库
 ```
 
@@ -179,4 +174,3 @@ Good Morning Technology, LLC 为依据美国法律设立的主体，并将在适
     Epusdt · Easy Payment USDT · Open Source Payment Gateway · 多链收款
   </sub>
 </p>
-

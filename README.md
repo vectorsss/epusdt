@@ -25,5 +25,3 @@ Quick links:
 - [Official Docs](https://epusdt.com)
 - [Telegram Channel](https://t.me/epusdt)
 - [Telegram Group](https://t.me/epusdt_group)
-- [Plugins](./plugins/)
-
