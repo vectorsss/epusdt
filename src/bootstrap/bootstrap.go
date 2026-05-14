@@ -60,6 +60,10 @@ func InitApp() {
 		if err != nil {
 			color.Red.Printf("[bootstrap] ensure default api key err=%s\n", err)
 		}
+		// Sweep any TON addresses stored under a previous canonical
+		// convention so the listener finds matching rows.
+		data.MigrateTonAddressesToCanonical()
+
 		mq.Start()
 		go telegram.BotStart()
 		go task.Start()

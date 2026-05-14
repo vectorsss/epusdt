@@ -6,6 +6,7 @@ import (
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/util/constant"
+	"github.com/GMWalletApp/epusdt/util/log"
 	tonaddress "github.com/xssnick/tonutils-go/address"
 )
 
@@ -29,9 +30,11 @@ func normalizeWalletNetwork(network string) string {
 
 // normalizeTonAddress collapses TON's three surface forms — bounceable
 // (EQ…), non-bounceable (UQ…), and raw (0:hex…) — into a single canonical
-// bounceable user-friendly string. Same underlying wallet, one storage
-// key. Returns the input unchanged if it cannot be parsed so the caller
-// surfaces validation errors at the DB layer.
+// non-bounceable user-friendly string. UQ-form is the convention modern
+// TON wallets (Tonkeeper, MyTonWallet, Tonhub) use for receive addresses,
+// so users see the same string they pasted in. Same underlying wallet,
+// one storage key. Returns the input unchanged if unparseable so the
+// caller surfaces validation errors at the DB layer.
 func normalizeTonAddress(addr string) string {
 	parsed, err := tonaddress.ParseAddr(addr)
 	if err != nil {
@@ -40,7 +43,7 @@ func normalizeTonAddress(addr string) string {
 			return addr
 		}
 	}
-	return parsed.Bounce(true).String()
+	return parsed.Bounce(false).String()
 }
 
 func normalizeWalletAddressByNetwork(network, address string) string {
@@ -188,4 +191,76 @@ func GetAllWalletAddressByNetwork(network string) ([]mdb.WalletAddress, error) {
 func ChangeWalletAddressStatus(id uint64, status int) error {
 	err := dao.Mdb.Model(&mdb.WalletAddress{}).Where("id = ?", id).Update("status", status).Error
 	return err
+}
+
+// MigrateTonAddressesToCanonical rewrites stored TON addresses to the
+// current canonical form (UQ non-bounceable). Older rows may have been
+// written under a previous EQ-bounceable convention; this sweep aligns
+// them with what newly-inserted rows now look like, so the admin UI
+// shows what users originally pasted in.
+//
+// Idempotent: a row already in canonical form parses back to the same
+// string, so re-running is a no-op. Safe on every startup.
+//
+// Sweeps wallet_address (primary DB, including soft-deleted rows) and
+// transaction_lock (runtime DB).
+func MigrateTonAddressesToCanonical() {
+	migrateTonWalletAddresses()
+	migrateTonTransactionLocks()
+}
+
+func migrateTonWalletAddresses() {
+	var rows []mdb.WalletAddress
+	if err := dao.Mdb.Unscoped().
+		Where("network = ?", mdb.NetworkTon).
+		Find(&rows).Error; err != nil {
+		log.Sugar.Errorf("[ton-migrate] read wallet_address err=%v", err)
+		return
+	}
+	rewritten := 0
+	for _, r := range rows {
+		raw := strings.TrimSpace(r.Address)
+		canonical := normalizeTonAddress(raw)
+		if canonical == "" || canonical == raw {
+			continue
+		}
+		if err := dao.Mdb.Unscoped().Model(&mdb.WalletAddress{}).
+			Where("id = ?", r.ID).
+			Update("address", canonical).Error; err != nil {
+			log.Sugar.Errorf("[ton-migrate] rewrite wallet_address id=%d err=%v", r.ID, err)
+			continue
+		}
+		rewritten++
+	}
+	if rewritten > 0 {
+		log.Sugar.Infof("[ton-migrate] rewrote %d wallet_address row(s) to UQ canonical", rewritten)
+	}
+}
+
+func migrateTonTransactionLocks() {
+	var rows []mdb.TransactionLock
+	if err := dao.RuntimeDB.
+		Where("network = ?", mdb.NetworkTon).
+		Find(&rows).Error; err != nil {
+		log.Sugar.Errorf("[ton-migrate] read transaction_lock err=%v", err)
+		return
+	}
+	rewritten := 0
+	for _, r := range rows {
+		raw := strings.TrimSpace(r.Address)
+		canonical := normalizeTonAddress(raw)
+		if canonical == "" || canonical == raw {
+			continue
+		}
+		if err := dao.RuntimeDB.Model(&mdb.TransactionLock{}).
+			Where("id = ?", r.ID).
+			Update("address", canonical).Error; err != nil {
+			log.Sugar.Errorf("[ton-migrate] rewrite transaction_lock id=%d err=%v", r.ID, err)
+			continue
+		}
+		rewritten++
+	}
+	if rewritten > 0 {
+		log.Sugar.Infof("[ton-migrate] rewrote %d transaction_lock row(s) to UQ canonical", rewritten)
+	}
 }

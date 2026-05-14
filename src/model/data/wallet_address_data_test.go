@@ -86,8 +86,9 @@ func TestAddWalletAddressWithNetworkKeepsOriginalCaseForNonEvm(t *testing.T) {
 // TestNormalizeTonAddressCollapsesSurfaceForms confirms that the three
 // user-facing TON address forms — bounceable (EQ…), non-bounceable
 // (UQ…), and raw (workchain:hex) — collapse to one canonical storage
-// key so a lock written from a notification matches a wallet entered
-// from the admin UI.
+// key (the UQ non-bounceable form, which modern TON wallets emit for
+// receive addresses) so a lock written from a notification matches a
+// wallet entered from the admin UI.
 func TestNormalizeTonAddressCollapsesSurfaceForms(t *testing.T) {
 	bounceable := "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
 	parsed, err := tonaddress.ParseAddr(bounceable)
@@ -97,15 +98,59 @@ func TestNormalizeTonAddressCollapsesSurfaceForms(t *testing.T) {
 	nonBounceable := parsed.Bounce(false).String()
 	raw := parsed.StringRaw()
 
-	canonical := normalizeTonAddress(bounceable)
-	if canonical != bounceable {
-		t.Fatalf("bounceable input should round-trip, got %q want %q", canonical, bounceable)
+	canonical := normalizeTonAddress(nonBounceable)
+	if canonical != nonBounceable {
+		t.Fatalf("non-bounceable input should round-trip, got %q want %q", canonical, nonBounceable)
 	}
-	if got := normalizeTonAddress(nonBounceable); got != canonical {
-		t.Fatalf("non-bounceable did not normalize to canonical: got %q want %q", got, canonical)
+	if got := normalizeTonAddress(bounceable); got != canonical {
+		t.Fatalf("bounceable did not normalize to canonical: got %q want %q", got, canonical)
 	}
 	if got := normalizeTonAddress(raw); got != canonical {
 		t.Fatalf("raw form did not normalize to canonical: got %q want %q", got, canonical)
+	}
+}
+
+// TestMigrateTonAddressesToCanonicalRewritesLegacyRows confirms the
+// upgrade-time migration sweep converts TON addresses that were
+// stored under the previous (bounceable EQ-form) canonical convention
+// to the current (non-bounceable UQ-form) one.
+func TestMigrateTonAddressesToCanonicalRewritesLegacyRows(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	bounceable := "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
+	parsed, err := tonaddress.ParseAddr(bounceable)
+	if err != nil {
+		t.Fatalf("parse seed bounceable: %v", err)
+	}
+	wantUQ := parsed.Bounce(false).String()
+
+	// Insert a legacy EQ-form row directly, bypassing normalization.
+	if err := dao.Mdb.Create(&mdb.WalletAddress{
+		Network: mdb.NetworkTon,
+		Address: bounceable,
+		Status:  mdb.TokenStatusEnable,
+	}).Error; err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	MigrateTonAddressesToCanonical()
+
+	var loaded mdb.WalletAddress
+	if err := dao.Mdb.Where("network = ?", mdb.NetworkTon).First(&loaded).Error; err != nil {
+		t.Fatalf("reload row: %v", err)
+	}
+	if loaded.Address != wantUQ {
+		t.Fatalf("after migration, address = %q, want UQ %q", loaded.Address, wantUQ)
+	}
+
+	// Re-running must be a no-op (idempotent).
+	MigrateTonAddressesToCanonical()
+	if err := dao.Mdb.Where("network = ?", mdb.NetworkTon).First(&loaded).Error; err != nil {
+		t.Fatalf("reload after second run: %v", err)
+	}
+	if loaded.Address != wantUQ {
+		t.Fatalf("idempotency violated: address = %q, want %q", loaded.Address, wantUQ)
 	}
 }
 
@@ -120,12 +165,12 @@ func TestAddWalletAddressWithNetworkCanonicalizesTonAddress(t *testing.T) {
 	}
 	nonBounceable := parsed.Bounce(false).String()
 
-	row, err := AddWalletAddressWithNetwork(mdb.NetworkTon, nonBounceable)
+	row, err := AddWalletAddressWithNetwork(mdb.NetworkTon, bounceable)
 	if err != nil {
 		t.Fatalf("add ton wallet: %v", err)
 	}
-	if row.Address != bounceable {
-		t.Fatalf("stored TON address = %q, want canonical %q", row.Address, bounceable)
+	if row.Address != nonBounceable {
+		t.Fatalf("stored TON address = %q, want canonical UQ %q", row.Address, nonBounceable)
 	}
 
 	// Looking up the same wallet by either surface form must hit the row.
