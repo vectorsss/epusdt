@@ -44,9 +44,8 @@ snapshot:
   name_template: "{{ incpatch .Version }}-next"
 
 release:
-  github:
-    owner: GMwalletApp
-    name: epusdt
+  # Owner/name auto-detected from the GitHub Actions environment
+  # (GITHUB_REPOSITORY), so the same config works for any fork.
   prerelease: auto
 
 changelog:

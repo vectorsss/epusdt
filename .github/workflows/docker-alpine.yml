@@ -10,7 +10,7 @@ on:
       - "v*"
 
 env:
-  DOCKERHUB_NAMESPACE: gmwallet
+  DOCKERHUB_NAMESPACE: dandanv5
   IMAGE_NAME: epusdt
 
 jobs:
