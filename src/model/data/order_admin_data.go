@@ -50,7 +50,71 @@ func ListOrders(f OrderListFilter) ([]mdb.Orders, int64, error) {
 	err := tx.Order("id DESC").
 		Offset((page - 1) * size).Limit(size).
 		Find(&rows).Error
-	return rows, total, err
+	if err != nil {
+		return rows, total, err
+	}
+	rows = applyDraftParentDisplay(rows)
+	return rows, total, nil
+}
+
+// applyDraftParentDisplay overlays sub-order display fields onto draft
+// parent rows (parent_trade_id='' and network=='') so the admin list
+// reads naturally instead of showing blank network/token/address cells.
+// Only the in-memory view is changed; the underlying DB row is untouched.
+//
+// Selection rule for the overlay source:
+//   1. Prefer the sub-order with is_selected=true (the one the user
+//      committed to in cashier).
+//   2. Fall back to the most recent sub-order (highest id) when none
+//      are selected.
+func applyDraftParentDisplay(rows []mdb.Orders) []mdb.Orders {
+	if len(rows) == 0 {
+		return rows
+	}
+	var draftTradeIDs []string
+	for _, r := range rows {
+		if r.ParentTradeId == "" && r.Network == "" {
+			draftTradeIDs = append(draftTradeIDs, r.TradeId)
+		}
+	}
+	if len(draftTradeIDs) == 0 {
+		return rows
+	}
+
+	var subs []mdb.Orders
+	if err := dao.Mdb.Model(&mdb.Orders{}).
+		Where("parent_trade_id IN ?", draftTradeIDs).
+		Order("id DESC"). // most recent first
+		Find(&subs).Error; err != nil || len(subs) == 0 {
+		return rows
+	}
+
+	picks := make(map[string]mdb.Orders, len(draftTradeIDs))
+	for _, sub := range subs {
+		existing, ok := picks[sub.ParentTradeId]
+		if !ok {
+			picks[sub.ParentTradeId] = sub
+			continue
+		}
+		if !existing.IsSelected && sub.IsSelected {
+			picks[sub.ParentTradeId] = sub
+		}
+	}
+
+	for i := range rows {
+		if rows[i].ParentTradeId != "" || rows[i].Network != "" {
+			continue
+		}
+		chosen, ok := picks[rows[i].TradeId]
+		if !ok {
+			continue
+		}
+		rows[i].Network = chosen.Network
+		rows[i].Token = chosen.Token
+		rows[i].ReceiveAddress = chosen.ReceiveAddress
+		rows[i].ActualAmount = chosen.ActualAmount
+	}
+	return rows
 }
 
 func buildOrderListQuery(f OrderListFilter) *gorm.DB {

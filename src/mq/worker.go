@@ -115,8 +115,12 @@ func processExpiredOrders() {
 			if !expired {
 				continue
 			}
-			if err = data.UnLockTransaction(order.Network, order.ReceiveAddress, order.Token, order.ActualAmount); err != nil {
-				log.Sugar.Warnf("[mq] release expired transaction lock failed, trade_id=%s, err=%v", order.TradeId, err)
+			// Draft parents (network=="") never allocated a wallet lock; skip
+			// the no-op query.
+			if order.Network != "" && order.ReceiveAddress != "" {
+				if err = data.UnLockTransaction(order.Network, order.ReceiveAddress, order.Token, order.ActualAmount); err != nil {
+					log.Sugar.Warnf("[mq] release expired transaction lock failed, trade_id=%s, err=%v", order.TradeId, err)
+				}
 			}
 		}
 

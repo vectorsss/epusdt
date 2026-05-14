@@ -835,3 +835,211 @@ func TestOrderProcessingSubOrderExpiresSiblingsAndReleasesLocks(t *testing.T) {
 		t.Fatalf("eth sub-order runtime lock still held: trade_id=%s", ethLock)
 	}
 }
+
+// TestCreateTransactionDraftMode verifies Plan E: when merchant sends
+// empty network (or token), CreateTransaction stores a parent row with
+// no chain identity / no locked wallet, and is_selected=false so the
+// cashier renders the network selector.
+func TestCreateTransactionDraftMode(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	// Note: no wallet allocation needed for draft mode — that's the
+	// point. If the service tried to allocate one, this test would
+	// fail with NotAvailableWalletAddress.
+
+	req := newCreateTransactionRequest("order_draft_1", 10)
+	req.Network = ""
+	req.Token = ""
+	resp, err := CreateTransaction(req, nil)
+	if err != nil {
+		t.Fatalf("create draft transaction: %v", err)
+	}
+
+	if resp.ReceiveAddress != "" {
+		t.Fatalf("draft response receive_address = %q, want empty", resp.ReceiveAddress)
+	}
+	if resp.Token != "" {
+		t.Fatalf("draft response token = %q, want empty", resp.Token)
+	}
+	if resp.ActualAmount != 0 {
+		t.Fatalf("draft response actual_amount = %v, want 0", resp.ActualAmount)
+	}
+
+	order, err := data.GetOrderInfoByTradeId(resp.TradeId)
+	if err != nil {
+		t.Fatalf("load draft order: %v", err)
+	}
+	if order.Network != "" || order.Token != "" || order.ReceiveAddress != "" {
+		t.Fatalf("draft order should have empty chain fields, got network=%q token=%q address=%q",
+			order.Network, order.Token, order.ReceiveAddress)
+	}
+	if order.ActualAmount != 0 {
+		t.Fatalf("draft order actual_amount = %v, want 0", order.ActualAmount)
+	}
+	if order.IsSelected {
+		t.Fatalf("draft order is_selected = true, want false (cashier should render selector)")
+	}
+	if got := fmt.Sprintf("%.2f", order.Amount); got != "10.00" {
+		t.Fatalf("draft order amount = %s, want 10.00 (fiat amount must persist)", got)
+	}
+	if order.OrderId != "order_draft_1" {
+		t.Fatalf("draft order merchant_order_id = %q, want order_draft_1", order.OrderId)
+	}
+	if order.NotifyUrl == "" {
+		t.Fatalf("draft order notify_url should persist for webhook routing")
+	}
+}
+
+// TestCreateTransactionDraftModePartialInputCollapses verifies that if
+// the merchant accidentally sends only one of network/token, the row is
+// normalized to fully-draft (both empty) instead of half-filled.
+func TestCreateTransactionDraftModePartialInputCollapses(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	req := newCreateTransactionRequest("order_partial_1", 10)
+	req.Network = "tron" // network set but...
+	req.Token = ""       // ...token empty
+	resp, err := CreateTransaction(req, nil)
+	if err != nil {
+		t.Fatalf("create partial draft: %v", err)
+	}
+	order, err := data.GetOrderInfoByTradeId(resp.TradeId)
+	if err != nil {
+		t.Fatalf("load partial draft order: %v", err)
+	}
+	if order.Network != "" {
+		t.Fatalf("partial draft order network = %q, want empty (should collapse)", order.Network)
+	}
+}
+
+// TestSwitchNetworkFromDraftParentUsesDerivedOrderID verifies B3: the
+// sub-order created from a draft parent gets an order_id derived from
+// the parent's order_id plus token+network suffix, so admin list
+// sorting visually clusters the parent with its sub-orders.
+func TestSwitchNetworkFromDraftParentUsesDerivedOrderID(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	if _, err := data.AddWalletAddress("TTestTronAddress001"); err != nil {
+		t.Fatalf("add tron wallet: %v", err)
+	}
+
+	// 1. Create draft parent.
+	parentReq := newCreateTransactionRequest("order_draft_sw", 10)
+	parentReq.Network = ""
+	parentReq.Token = ""
+	parentResp, err := CreateTransaction(parentReq, nil)
+	if err != nil {
+		t.Fatalf("create draft parent: %v", err)
+	}
+
+	// 2. User picks USDT on tron in cashier.
+	subResp, err := SwitchNetwork(&request.SwitchNetworkRequest{
+		TradeId: parentResp.TradeId,
+		Token:   "usdt",
+		Network: mdb.NetworkTron,
+	})
+	if err != nil {
+		t.Fatalf("switch network from draft: %v", err)
+	}
+	sub, err := data.GetOrderInfoByTradeId(subResp.TradeId)
+	if err != nil {
+		t.Fatalf("load sub-order: %v", err)
+	}
+
+	// 3. Sub-order's OrderId must be parent.OrderId + "_usdt_tron".
+	wantOrderID := "order_draft_sw_usdt_tron"
+	if sub.OrderId != wantOrderID {
+		t.Fatalf("sub-order order_id = %q, want %q", sub.OrderId, wantOrderID)
+	}
+	if sub.Network != mdb.NetworkTron {
+		t.Fatalf("sub-order network = %q, want tron", sub.Network)
+	}
+	if sub.Token != "USDT" {
+		t.Fatalf("sub-order token = %q, want USDT", sub.Token)
+	}
+	if sub.ReceiveAddress == "" {
+		t.Fatalf("sub-order receive_address must be allocated")
+	}
+	if !sub.IsSelected {
+		t.Fatalf("sub-order is_selected = false, want true")
+	}
+
+	// 4. Parent should now be is_selected=true (refreshed by SwitchNetwork)
+	//    but its chain fields stay empty (parent stays draft on disk).
+	parent, err := data.GetOrderInfoByTradeId(parentResp.TradeId)
+	if err != nil {
+		t.Fatalf("reload parent: %v", err)
+	}
+	if !parent.IsSelected {
+		t.Fatalf("parent is_selected = false after SwitchNetwork, want true")
+	}
+	if parent.Network != "" {
+		t.Fatalf("parent network should remain empty (draft), got %q", parent.Network)
+	}
+}
+
+// TestOrderProcessingDraftParentPaidViaSubOrder is the Plan E end-to-end
+// happy path: draft parent → SwitchNetwork → user pays sub-order →
+// parent gets marked paid → webhook can route by parent.OrderId.
+//
+// Critically also verifies E3: OrderProcessing must not crash or warn
+// loudly when releasing the locks of a draft parent that never had any.
+func TestOrderProcessingDraftParentPaidViaSubOrder(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	if _, err := data.AddWalletAddress("TTestTronAddress001"); err != nil {
+		t.Fatalf("add tron wallet: %v", err)
+	}
+
+	// 1. Create draft parent.
+	parentReq := newCreateTransactionRequest("order_e2e_draft", 10)
+	parentReq.Network = ""
+	parentReq.Token = ""
+	parentResp, err := CreateTransaction(parentReq, nil)
+	if err != nil {
+		t.Fatalf("create draft parent: %v", err)
+	}
+
+	// 2. SwitchNetwork to tron.
+	subResp, err := SwitchNetwork(&request.SwitchNetworkRequest{
+		TradeId: parentResp.TradeId,
+		Token:   "usdt",
+		Network: mdb.NetworkTron,
+	})
+	if err != nil {
+		t.Fatalf("switch network: %v", err)
+	}
+
+	// 3. Pay the sub-order on chain.
+	err = OrderProcessing(&request.OrderProcessingRequest{
+		ReceiveAddress:     subResp.ReceiveAddress,
+		Token:              strings.ToUpper(subResp.Token),
+		Network:            strings.ToLower(subResp.Network),
+		TradeId:            subResp.TradeId,
+		Amount:             subResp.ActualAmount,
+		BlockTransactionId: "block_e2e_draft",
+	})
+	if err != nil {
+		t.Fatalf("order processing: %v", err)
+	}
+
+	// 4. Parent must be paid and queued for callback (notify_url is what
+	//    TokenPilot relies on for webhook routing).
+	parent, err := data.GetOrderInfoByTradeId(parentResp.TradeId)
+	if err != nil {
+		t.Fatalf("reload parent: %v", err)
+	}
+	if parent.Status != mdb.StatusPaySuccess {
+		t.Fatalf("parent status = %d, want %d (paid)", parent.Status, mdb.StatusPaySuccess)
+	}
+	if parent.CallBackConfirm != mdb.CallBackConfirmNo {
+		t.Fatalf("parent callback_confirm = %d, want %d (queued for webhook)", parent.CallBackConfirm, mdb.CallBackConfirmNo)
+	}
+	if parent.OrderId != "order_e2e_draft" {
+		t.Fatalf("parent merchant order_id changed to %q (must stay for webhook routing)", parent.OrderId)
+	}
+}

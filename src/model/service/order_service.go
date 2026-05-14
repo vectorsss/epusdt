@@ -64,6 +64,15 @@ func normalizeOrderAddressByNetwork(network, address string) string {
 }
 
 // CreateTransaction creates a new payment order.
+//
+// Two modes:
+//   - "Bound" (network+token both set): allocate wallet, lock amount, create
+//     order ready to pay. is_selected=true so cashier renders QR directly.
+//   - "Draft" (network or token empty): create a parent that only stores
+//     merchant identity (order_id, notify_url, amount in fiat). User picks
+//     token+network in cashier; SwitchNetwork creates the real sub-order
+//     that holds the wallet/amount and gets paid. Webhook still routes via
+//     parent.order_id when the sub-order settles.
 func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey) (*response.CreateTransactionResponse, error) {
 	gCreateTransactionLock.Lock()
 	defer gCreateTransactionLock.Unlock()
@@ -73,17 +82,16 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 	network := strings.ToLower(strings.TrimSpace(req.Network))
 	amountPrecision := data.GetAmountPrecision()
 	payAmount := math.MustParsePrecFloat64(req.Amount, amountPrecision)
-	rate := config.GetRateForCoin(strings.ToLower(token), strings.ToLower(currency))
-	if rate <= 0 {
-		return nil, constant.RateAmountErr
+
+	// Normalize: partial input (one of network/token empty) collapses to
+	// fully-draft so DB never holds half-filled rows.
+	isDraft := network == "" || token == ""
+	if isDraft {
+		network = ""
+		token = ""
 	}
 
-	decimalPayAmount := decimal.NewFromFloat(payAmount)
-	decimalTokenAmount := decimalPayAmount.Mul(decimal.NewFromFloat(rate))
-	if decimalPayAmount.Cmp(decimal.NewFromFloat(CnyMinimumPaymentAmount)) == -1 {
-		return nil, constant.PayAmountErr
-	}
-	if decimalTokenAmount.Cmp(decimal.NewFromFloat(UsdtMinimumPaymentAmount)) == -1 {
+	if decimal.NewFromFloat(payAmount).Cmp(decimal.NewFromFloat(CnyMinimumPaymentAmount)) == -1 {
 		return nil, constant.PayAmountErr
 	}
 
@@ -95,25 +103,43 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 		return nil, constant.OrderAlreadyExists
 	}
 
-	if !data.IsChainEnabled(network) {
-		return nil, constant.ChainNotEnabled
-	}
-	walletAddress, err := data.GetAvailableWalletAddressByNetwork(network)
-	if err != nil {
-		return nil, err
-	}
-	if len(walletAddress) <= 0 {
-		return nil, constant.NotAvailableWalletAddress
-	}
-
 	tradeID := GenerateCode()
-	amount := math.MustParsePrecFloat64(decimalTokenAmount.InexactFloat64(), amountPrecision)
-	availableAddress, availableAmount, err := ReserveAvailableWalletAndAmount(tradeID, network, token, amount, walletAddress)
-	if err != nil {
-		return nil, err
-	}
-	if availableAddress == "" {
-		return nil, constant.NotAvailableAmountErr
+	var (
+		actualAmount   float64
+		receiveAddress string
+	)
+
+	if !isDraft {
+		rate := config.GetRateForCoin(strings.ToLower(token), strings.ToLower(currency))
+		if rate <= 0 {
+			return nil, constant.RateAmountErr
+		}
+		decimalTokenAmount := decimal.NewFromFloat(payAmount).Mul(decimal.NewFromFloat(rate))
+		if decimalTokenAmount.Cmp(decimal.NewFromFloat(UsdtMinimumPaymentAmount)) == -1 {
+			return nil, constant.PayAmountErr
+		}
+
+		if !data.IsChainEnabled(network) {
+			return nil, constant.ChainNotEnabled
+		}
+		walletAddress, err := data.GetAvailableWalletAddressByNetwork(network)
+		if err != nil {
+			return nil, err
+		}
+		if len(walletAddress) <= 0 {
+			return nil, constant.NotAvailableWalletAddress
+		}
+
+		amount := math.MustParsePrecFloat64(decimalTokenAmount.InexactFloat64(), amountPrecision)
+		availableAddress, availableAmount, err := ReserveAvailableWalletAndAmount(tradeID, network, token, amount, walletAddress)
+		if err != nil {
+			return nil, err
+		}
+		if availableAddress == "" {
+			return nil, constant.NotAvailableAmountErr
+		}
+		actualAmount = availableAmount
+		receiveAddress = availableAddress
 	}
 
 	tx := dao.Mdb.Begin()
@@ -122,8 +148,8 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 		OrderId:        req.OrderId,
 		Amount:         payAmount,
 		Currency:       currency,
-		ActualAmount:   availableAmount,
-		ReceiveAddress: availableAddress,
+		ActualAmount:   actualAmount,
+		ReceiveAddress: receiveAddress,
 		Token:          token,
 		Network:        network,
 		Status:         mdb.StatusWaitPay,
@@ -133,16 +159,20 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 		PaymentType:    req.PaymentType,
 		PayProvider:    mdb.PaymentProviderOnChain,
 		ApiKeyID:       apiKeyID(apiKey),
-		IsSelected:     true,
+		IsSelected:     !isDraft,
 	}
 	if err = data.CreateOrderWithTransaction(tx, order); err != nil {
 		tx.Rollback()
-		_ = data.UnLockTransactionByTradeId(tradeID)
+		if !isDraft {
+			_ = data.UnLockTransactionByTradeId(tradeID)
+		}
 		return nil, err
 	}
 	if err = tx.Commit().Error; err != nil {
 		tx.Rollback()
-		_ = data.UnLockTransactionByTradeId(tradeID)
+		if !isDraft {
+			_ = data.UnLockTransactionByTradeId(tradeID)
+		}
 		return nil, err
 	}
 
@@ -268,9 +298,12 @@ func OrderProcessing(req *request.OrderProcessingRequest) error {
 		log.Sugar.Warnf("[order] reset sub-order callback_confirm failed, trade_id=%s, err=%v", order.TradeId, err)
 	}
 
-	// Release parent's own wallet lock
-	if err = data.UnLockTransaction(parent.Network, parent.ReceiveAddress, parent.Token, parent.ActualAmount); err != nil {
-		log.Sugar.Warnf("[order] unlock parent transaction failed, parent_trade_id=%s, err=%v", parent.TradeId, err)
+	// Release parent's own wallet lock. Draft parents (network=="") never
+	// allocated one, so skip the call rather than running a no-op query.
+	if parent.Network != "" && parent.ReceiveAddress != "" {
+		if err = data.UnLockTransaction(parent.Network, parent.ReceiveAddress, parent.Token, parent.ActualAmount); err != nil {
+			log.Sugar.Warnf("[order] unlock parent transaction failed, parent_trade_id=%s, err=%v", parent.TradeId, err)
+		}
 	}
 
 	// Release sibling locks after their status transitions commit.
@@ -332,6 +365,18 @@ func GenerateCode() string {
 	date := time.Now().Format("20060102")
 	r := rand.Intn(1000)
 	return fmt.Sprintf("%s%d%03d", date, time.Now().UnixNano()/1e6, r)
+}
+
+// deriveSubOrderID composes a sub-order's merchant order_id from its
+// parent's order_id plus the token+network suffix. Sorting the admin
+// list by order_id then clusters siblings under their parent.
+//
+// The unique-constraint guarantee: SwitchNetwork dedups chain sub-orders
+// by (parent, token, network) and OkPay sub-orders by (parent, token,
+// provider), so this suffix is collision-free across both paths as long
+// as okpay uses a distinct suffix from the network value.
+func deriveSubOrderID(parentOrderID, token, network string) string {
+	return fmt.Sprintf("%s_%s_%s", parentOrderID, strings.ToLower(token), network)
 }
 
 // GetOrderInfoByTradeId returns a validated order.
@@ -441,7 +486,7 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 	tx := dao.Mdb.Begin()
 	subOrder := &mdb.Orders{
 		TradeId:         subTradeID,
-		OrderId:         subTradeID, // sub-order uses its own trade_id as order_id (unique constraint)
+		OrderId:         deriveSubOrderID(parent.OrderId, token, network),
 		ParentTradeId:   parent.TradeId,
 		Amount:          parent.Amount,
 		Currency:        parent.Currency,
@@ -556,8 +601,11 @@ func switchToOkPay(parent *mdb.Orders, token string) (*response.CheckoutCounterR
 
 	tx := dao.Mdb.Begin()
 	subOrder := &mdb.Orders{
-		TradeId:         subTradeID,
-		OrderId:         subTradeID,
+		TradeId: subTradeID,
+		// Use "okpay" as the suffix instead of the carrier network so the
+		// OkPay sub-order's OrderId can't collide with a chain sub-order
+		// for the same token+tron pair.
+		OrderId:         deriveSubOrderID(parent.OrderId, token, mdb.PaymentProviderOkPay),
 		ParentTradeId:   parent.TradeId,
 		Amount:          parent.Amount,
 		Currency:        parent.Currency,
