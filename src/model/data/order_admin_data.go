@@ -75,10 +75,10 @@ func buildOrderListQuery(f OrderListFilter) *gorm.DB {
 		tx = tx.Where("trade_id LIKE ? OR order_id LIKE ? OR block_transaction_id LIKE ?", kw, kw, kw)
 	}
 	if f.StartAt != nil {
-		tx = tx.Where("created_at >= ?", *f.StartAt)
+		tx = tx.Where("created_at >= ?", f.StartAt.Format("2006-01-02 15:04:05"))
 	}
 	if f.EndAt != nil {
-		tx = tx.Where("created_at <= ?", *f.EndAt)
+		tx = tx.Where("created_at <= ?", f.EndAt.Format("2006-01-02 15:04:05"))
 	}
 	return tx
 }

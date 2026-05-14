@@ -7,6 +7,14 @@ import (
 	"github.com/GMWalletApp/epusdt/model/mdb"
 )
 
+// sqliteTime formats a time.Time to match the carbon.Time storage format
+// used by GORM in SQLite. Without this, time.Time serializes as RFC3339
+// ("2006-01-02T15:04:05+07:00") while carbon stores "2006-01-02 15:04:05",
+// causing lexicographic comparison failures on same-day queries.
+func sqliteTime(t time.Time) string {
+	return t.Format("2006-01-02 15:04:05")
+}
+
 // DailyStat is one bucket of day-level aggregation used by the
 // dashboard trend charts.
 // Field "Day" holds "YYYY-MM-DD" for daily buckets and
@@ -42,8 +50,8 @@ func DailyOrderStats(start, end time.Time) ([]DailyStat, error) {
             SUM(CASE WHEN status = ? THEN amount ELSE 0 END) AS total_amount,
             SUM(CASE WHEN status = ? THEN actual_amount ELSE 0 END) AS actual_amount`,
 			mdb.StatusPaySuccess, mdb.StatusPaySuccess, mdb.StatusPaySuccess).
-		Where("created_at >= ?", start).
-		Where("created_at <= ?", end).
+		Where("created_at >= ?", sqliteTime(start)).
+		Where("created_at <= ?", sqliteTime(end)).
 		Group("DATE(created_at)").
 		Order("day ASC").
 		Scan(&rows).Error
@@ -64,8 +72,8 @@ func HourlyOrderStats(start, end time.Time) ([]DailyStat, error) {
             SUM(CASE WHEN status = ? THEN amount ELSE 0 END) AS total_amount,
             SUM(CASE WHEN status = ? THEN actual_amount ELSE 0 END) AS actual_amount`,
 			mdb.StatusPaySuccess, mdb.StatusPaySuccess, mdb.StatusPaySuccess).
-		Where("created_at >= ?", start).
-		Where("created_at <= ?", end).
+		Where("created_at >= ?", sqliteTime(start)).
+		Where("created_at <= ?", sqliteTime(end)).
 		Group("strftime('%Y-%m-%d %H:00', created_at)").
 		Order("day ASC").
 		Scan(&rows).Error
@@ -126,8 +134,8 @@ func DailyAssetByAddress(start, end time.Time) ([]AddressDailyStat, error) {
 	err := dao.Mdb.Model(&mdb.Orders{}).
 		Select("DATE(created_at) AS day, receive_address AS address, SUM(actual_amount) AS actual_amount").
 		Where("status = ?", mdb.StatusPaySuccess).
-		Where("created_at >= ?", start).
-		Where("created_at <= ?", end).
+		Where("created_at >= ?", sqliteTime(start)).
+		Where("created_at <= ?", sqliteTime(end)).
 		Group("DATE(created_at), receive_address").
 		Order("day ASC").
 		Scan(&rows).Error
@@ -144,8 +152,8 @@ func HourlyAssetByAddress(start, end time.Time) ([]AddressDailyStat, error) {
 	err := dao.Mdb.Model(&mdb.Orders{}).
 		Select("strftime('%Y-%m-%d %H:00', created_at) AS day, receive_address AS address, SUM(actual_amount) AS actual_amount").
 		Where("status = ?", mdb.StatusPaySuccess).
-		Where("created_at >= ?", start).
-		Where("created_at <= ?", end).
+		Where("created_at >= ?", sqliteTime(start)).
+		Where("created_at <= ?", sqliteTime(end)).
 		Group("strftime('%Y-%m-%d %H:00', created_at), receive_address").
 		Order("day ASC").
 		Scan(&rows).Error
@@ -231,8 +239,8 @@ func PaidStatsInRange(start, end time.Time) (int64, int64, float64, error) {
             SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS success_count,
             SUM(CASE WHEN status = ? THEN actual_amount ELSE 0 END) AS actual_sum`,
 			mdb.StatusPaySuccess, mdb.StatusPaySuccess).
-		Where("created_at >= ?", start).
-		Where("created_at <= ?", end).
+		Where("created_at >= ?", sqliteTime(start)).
+		Where("created_at <= ?", sqliteTime(end)).
 		Scan(&r).Error
 	return r.OrderCount, r.SuccessCount, r.ActualSum, err
 }
@@ -242,8 +250,8 @@ func PaidStatsInRange(start, end time.Time) (int64, int64, float64, error) {
 func ActiveAddressCountInRange(start, end time.Time) (int64, error) {
 	var count int64
 	err := dao.Mdb.Model(&mdb.Orders{}).
-		Where("created_at >= ?", start).
-		Where("created_at <= ?", end).
+		Where("created_at >= ?", sqliteTime(start)).
+		Where("created_at <= ?", sqliteTime(end)).
 		Distinct("receive_address").
 		Count(&count).Error
 	return count, err
@@ -267,8 +275,8 @@ func AveragePaymentDurationSeconds(start, end time.Time) (float64, error) {
 	err := dao.Mdb.Model(&mdb.Orders{}).
 		Select("created_at, updated_at").
 		Where("status = ?", mdb.StatusPaySuccess).
-		Where("created_at >= ?", start).
-		Where("created_at <= ?", end).
+		Where("created_at >= ?", sqliteTime(start)).
+		Where("created_at <= ?", sqliteTime(end)).
 		Scan(&pairs).Error
 	if err != nil {
 		return 0, err
@@ -289,8 +297,8 @@ func CountExpiredInRange(start, end time.Time) (int64, error) {
 	var n int64
 	err := dao.Mdb.Model(&mdb.Orders{}).
 		Where("status = ?", mdb.StatusExpired).
-		Where("created_at >= ?", start).
-		Where("created_at <= ?", end).
+		Where("created_at >= ?", sqliteTime(start)).
+		Where("created_at <= ?", sqliteTime(end)).
 		Count(&n).Error
 	return n, err
 }

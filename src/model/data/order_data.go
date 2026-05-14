@@ -157,7 +157,7 @@ func UpdateOrderIsExpirationById(id uint64, expirationCutoff time.Time) (bool, e
 	result := dao.Mdb.Model(mdb.Orders{}).
 		Where("id = ?", id).
 		Where("status = ?", mdb.StatusWaitPay).
-		Where("created_at <= ?", expirationCutoff).
+		Where("created_at <= ?", expirationCutoff.Format("2006-01-02 15:04:05")).
 		Update("status", mdb.StatusExpired)
 	return result.RowsAffected > 0, result.Error
 }

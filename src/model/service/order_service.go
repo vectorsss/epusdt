@@ -133,6 +133,7 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 		PaymentType:    req.PaymentType,
 		PayProvider:    mdb.PaymentProviderOnChain,
 		ApiKeyID:       apiKeyID(apiKey),
+		IsSelected:     true,
 	}
 	if err = data.CreateOrderWithTransaction(tx, order); err != nil {
 		tx.Rollback()

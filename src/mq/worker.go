@@ -93,7 +93,7 @@ func processExpiredOrders() {
 			return dao.Mdb.Model(&mdb.Orders{}).
 				Select("id", "trade_id", "network", "receive_address", "token", "actual_amount").
 				Where("status = ?", mdb.StatusWaitPay).
-				Where("created_at <= ?", expirationCutoff).
+				Where("created_at <= ?", expirationCutoff.Format("2006-01-02 15:04:05")).
 				Order("id asc").
 				Limit(batchSize).
 				Find(&orders).Error
