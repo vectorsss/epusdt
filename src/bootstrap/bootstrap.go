@@ -64,6 +64,15 @@ func InitApp() {
 		// convention so the listener finds matching rows.
 		data.MigrateTonAddressesToCanonical()
 
+		// One-time backfill: copy chain fields from paid sub-orders onto
+		// already-paid draft parents that pre-date the inline overlay.
+		// Idempotent — matches nothing once everyone has been backfilled.
+		if affected, err := data.BackfillDraftParentFields(); err != nil {
+			color.Red.Printf("[bootstrap] backfill draft parents err=%s\n", err)
+		} else if affected > 0 {
+			log.Sugar.Infof("[bootstrap] backfilled chain fields onto %d historical draft parent(s)", affected)
+		}
+
 		mq.Start()
 		go telegram.BotStart()
 		go task.Start()

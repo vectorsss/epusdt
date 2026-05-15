@@ -148,3 +148,54 @@ func TestDailyAssetByAddressAggregatesCarbonStoredCreatedAt(t *testing.T) {
 		t.Fatalf("DailyAssetByAddress returned %d rows, none with the inserted address+amount — date extraction regression?", len(rows))
 	}
 }
+
+// TestPaidStatsInRangeCountsParentsOnly verifies Step 2's filter: with
+// parent_trade_id='' applied, each Plan E payment is counted once
+// (as the parent) instead of twice (parent + sub).
+func TestPaidStatsInRangeCountsParentsOnly(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	parent := mdb.Orders{
+		TradeId:        "stats_p",
+		OrderId:        "merchant_stats",
+		Amount:         10,
+		Currency:       "CNY",
+		ActualAmount:   1.63,
+		ReceiveAddress: "UQ",
+		Network:        mdb.NetworkTon,
+		Token:          "USDT",
+		Status:         mdb.StatusPaySuccess,
+		PayProvider:    mdb.PaymentProviderOnChain,
+	}
+	dao.Mdb.Create(&parent)
+	sub := mdb.Orders{
+		TradeId:        "stats_s",
+		OrderId:        "merchant_stats_usdt_ton",
+		ParentTradeId:  parent.TradeId,
+		Amount:         10,
+		Currency:       "CNY",
+		ActualAmount:   1.63,
+		ReceiveAddress: "UQ",
+		Network:        mdb.NetworkTon,
+		Token:          "USDT",
+		Status:         mdb.StatusPaySuccess,
+		PayProvider:    mdb.PaymentProviderOnChain,
+	}
+	dao.Mdb.Create(&sub)
+
+	now := time.Now()
+	orderCount, successCount, actualSum, err := PaidStatsInRange(now.Add(-time.Hour), now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("PaidStatsInRange: %v", err)
+	}
+	if orderCount != 1 {
+		t.Errorf("order_count = %d, want 1 (parent only, sub filtered)", orderCount)
+	}
+	if successCount != 1 {
+		t.Errorf("success_count = %d, want 1", successCount)
+	}
+	if actualSum < 1.62 || actualSum > 1.64 {
+		t.Errorf("actual_sum = %v, want ~1.63 (parent contributes once)", actualSum)
+	}
+}

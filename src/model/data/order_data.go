@@ -197,9 +197,13 @@ func GetSiblingSubOrders(parentTradeId string, excludeTradeId string) ([]mdb.Ord
 }
 
 // MarkParentOrderSuccess marks the parent order as paid and records which sub-order
-// settled it. Only the status, callback_confirm, and pay_by_sub_id fields are updated;
-// the parent's own block_transaction_id, actual_amount, and receive_address are
-// intentionally left unchanged because the parent was not directly paid.
+// settled it. For non-draft parents (network set at creation), only status,
+// callback_confirm, and pay_by_sub_id are updated — the parent's own chain
+// identity stays as a historical record of what was originally quoted.
+// For draft parents (Plan E: network=''), the sub's chain fields are also
+// copied onto the parent so dashboard queries can use a single
+// parent_trade_id='' filter to get "one row per merchant payment" with
+// real amounts.
 func MarkParentOrderSuccess(parentTradeId string, sub *mdb.Orders) (bool, error) {
 	return MarkParentOrderSuccessWithTransaction(dao.Mdb, parentTradeId, sub)
 }
@@ -215,7 +219,53 @@ func MarkParentOrderSuccessWithTransaction(tx *gorm.DB, parentTradeId string, su
 			"callback_confirm": mdb.CallBackConfirmNo,
 			"pay_by_sub_id":    sub.ID,
 		})
-	return result.RowsAffected > 0, result.Error
+	if result.Error != nil || result.RowsAffected == 0 {
+		return result.RowsAffected > 0, result.Error
+	}
+
+	// Second UPDATE: copy sub's chain fields onto the parent — but ONLY
+	// when the parent has no chain identity of its own (the WHERE network=''
+	// guard). Non-draft parents keep their original quote untouched, so
+	// switch-network flows (e.g. quoted USDT-tron, paid via OkPay) don't
+	// have their parent row overwritten by the carrier sub-order.
+	overlay := tx.Model(&mdb.Orders{}).
+		Where("trade_id = ?", parentTradeId).
+		Where("network = ?", "").
+		Updates(map[string]interface{}{
+			"network":              sub.Network,
+			"token":                sub.Token,
+			"receive_address":      sub.ReceiveAddress,
+			"actual_amount":        sub.ActualAmount,
+			"block_transaction_id": sub.BlockTransactionId,
+		})
+	if overlay.Error != nil {
+		return result.RowsAffected > 0, overlay.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// BackfillDraftParentFields one-time-migrates already-paid draft parents
+// from before the inline overlay shipped: for each draft parent that's
+// status=PaySuccess but still has empty network, copy the chain fields
+// from the sub-order that settled it (via pay_by_sub_id). Idempotent —
+// re-running matches no rows once the first run completes. Safe to call
+// on every bootstrap.
+func BackfillDraftParentFields() (int64, error) {
+	// Single UPDATE with correlated subqueries. Faster than a Go loop
+	// and atomic from sqlite's perspective.
+	res := dao.Mdb.Exec(`
+		UPDATE orders
+		SET network              = (SELECT s.network              FROM orders s WHERE s.id = orders.pay_by_sub_id),
+		    token                = (SELECT s.token                FROM orders s WHERE s.id = orders.pay_by_sub_id),
+		    receive_address      = (SELECT s.receive_address      FROM orders s WHERE s.id = orders.pay_by_sub_id),
+		    actual_amount        = (SELECT s.actual_amount        FROM orders s WHERE s.id = orders.pay_by_sub_id),
+		    block_transaction_id = (SELECT s.block_transaction_id FROM orders s WHERE s.id = orders.pay_by_sub_id)
+		WHERE parent_trade_id = ''
+		  AND network = ''
+		  AND status = ?
+		  AND pay_by_sub_id > 0`,
+		mdb.StatusPaySuccess)
+	return res.RowsAffected, res.Error
 }
 
 // ExpireSiblingSubOrdersWithTransaction expires all waiting sibling
