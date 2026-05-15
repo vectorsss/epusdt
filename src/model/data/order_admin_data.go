@@ -62,11 +62,18 @@ func ListOrders(f OrderListFilter) ([]mdb.Orders, int64, error) {
 // reads naturally instead of showing blank network/token/address cells.
 // Only the in-memory view is changed; the underlying DB row is untouched.
 //
-// Selection rule for the overlay source:
-//   1. Prefer the sub-order with is_selected=true (the one the user
-//      committed to in cashier).
-//   2. Fall back to the most recent sub-order (highest id) when none
-//      are selected.
+// Overlaid fields:
+//   - Network, Token, ReceiveAddress, ActualAmount  (B2)
+//   - BlockTransactionId                            (B5 — lets admin
+//     copy the on-chain tx hash to a block explorer without drilling
+//     into the sub-order)
+//
+// Selection rule for the overlay source, ordered:
+//   1. The paid sub-order (Status=PaySuccess) — the one that actually
+//      settled the parent, so its block_tx_id is the authoritative one.
+//   2. The selected sub-order (IsSelected=true) — the chain the user
+//      committed to in cashier, before payment lands.
+//   3. The most recent sub-order (highest id) — fallback.
 func applyDraftParentDisplay(rows []mdb.Orders) []mdb.Orders {
 	if len(rows) == 0 {
 		return rows
@@ -89,14 +96,22 @@ func applyDraftParentDisplay(rows []mdb.Orders) []mdb.Orders {
 		return rows
 	}
 
+	// Higher score wins.
+	score := func(o mdb.Orders) int {
+		switch {
+		case o.Status == mdb.StatusPaySuccess:
+			return 2
+		case o.IsSelected:
+			return 1
+		default:
+			return 0
+		}
+	}
+
 	picks := make(map[string]mdb.Orders, len(draftTradeIDs))
 	for _, sub := range subs {
 		existing, ok := picks[sub.ParentTradeId]
-		if !ok {
-			picks[sub.ParentTradeId] = sub
-			continue
-		}
-		if !existing.IsSelected && sub.IsSelected {
+		if !ok || score(sub) > score(existing) {
 			picks[sub.ParentTradeId] = sub
 		}
 	}
@@ -113,6 +128,7 @@ func applyDraftParentDisplay(rows []mdb.Orders) []mdb.Orders {
 		rows[i].Token = chosen.Token
 		rows[i].ReceiveAddress = chosen.ReceiveAddress
 		rows[i].ActualAmount = chosen.ActualAmount
+		rows[i].BlockTransactionId = chosen.BlockTransactionId
 	}
 	return rows
 }

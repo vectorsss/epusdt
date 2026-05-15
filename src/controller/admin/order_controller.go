@@ -257,12 +257,20 @@ func (c *BaseAdminController) ExportOrders(ctx echo.Context) error {
 
 // parseOrderFilter extracts filter + pagination values from the query
 // string. Time params are Unix seconds.
+//
+// ParentOnly defaults to true: each merchant payment is one logical order
+// (the parent), and the chain-binding sub-order is an implementation
+// detail surfaced by applyDraftParentDisplay's field overlay. Surfacing
+// both rows in the default list double-counts payments and confuses
+// operators. Pass ?include_sub=true to opt out (or use the dedicated
+// /orders/list-with-sub endpoint for the hierarchical view).
 func parseOrderFilter(ctx echo.Context) data.OrderListFilter {
 	f := data.OrderListFilter{
-		Network: strings.ToLower(strings.TrimSpace(ctx.QueryParam("network"))),
-		Token:   strings.ToUpper(strings.TrimSpace(ctx.QueryParam("token"))),
-		Address: strings.TrimSpace(ctx.QueryParam("address")),
-		Keyword: strings.TrimSpace(ctx.QueryParam("keyword")),
+		Network:    strings.ToLower(strings.TrimSpace(ctx.QueryParam("network"))),
+		Token:      strings.ToUpper(strings.TrimSpace(ctx.QueryParam("token"))),
+		Address:    strings.TrimSpace(ctx.QueryParam("address")),
+		Keyword:    strings.TrimSpace(ctx.QueryParam("keyword")),
+		ParentOnly: ctx.QueryParam("include_sub") != "true",
 	}
 	if s := ctx.QueryParam("status"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil {
