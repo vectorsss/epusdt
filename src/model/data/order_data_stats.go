@@ -15,6 +15,19 @@ func sqliteTime(t time.Time) string {
 	return t.Format("2006-01-02 15:04:05")
 }
 
+// Carbon stores timestamps as "YYYY-MM-DD HH:MM:SS.ffffff +HHMM TZ"
+// (e.g. "2026-05-15 13:38:31.602759 +0300 MSK"). SQLite's DATE() and
+// strftime() functions reject this format because of the trailing
+// " +HHMM TZ" — they silently return empty string and every row gets
+// grouped under the "" bucket, then zero-filled away by the chart
+// post-processing. SUBSTR is the only date extractor that works
+// regardless of the trailing junk: the first 10 chars are always
+// "YYYY-MM-DD" and chars 1-13 are always "YYYY-MM-DD HH".
+const (
+	sqlDayExpr  = "SUBSTR(created_at, 1, 10)"
+	sqlHourExpr = "SUBSTR(created_at, 1, 13) || ':00'"
+)
+
 // DailyStat is one bucket of day-level aggregation used by the
 // dashboard trend charts.
 // Field "Day" holds "YYYY-MM-DD" for daily buckets and
@@ -44,7 +57,7 @@ type AddressDailyStat struct {
 func DailyOrderStats(start, end time.Time) ([]DailyStat, error) {
 	var rows []DailyStat
 	err := dao.Mdb.Model(&mdb.Orders{}).
-		Select(`DATE(created_at) AS day,
+		Select(sqlDayExpr+` AS day,
             COUNT(*) AS order_count,
             SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS success_count,
             SUM(CASE WHEN status = ? THEN amount ELSE 0 END) AS total_amount,
@@ -52,7 +65,7 @@ func DailyOrderStats(start, end time.Time) ([]DailyStat, error) {
 			mdb.StatusPaySuccess, mdb.StatusPaySuccess, mdb.StatusPaySuccess).
 		Where("created_at >= ?", sqliteTime(start)).
 		Where("created_at <= ?", sqliteTime(end)).
-		Group("DATE(created_at)").
+		Group(sqlDayExpr).
 		Order("day ASC").
 		Scan(&rows).Error
 	if err != nil {
@@ -66,7 +79,7 @@ func DailyOrderStats(start, end time.Time) ([]DailyStat, error) {
 func HourlyOrderStats(start, end time.Time) ([]DailyStat, error) {
 	var rows []DailyStat
 	err := dao.Mdb.Model(&mdb.Orders{}).
-		Select(`strftime('%Y-%m-%d %H:00', created_at) AS day,
+		Select(sqlHourExpr+` AS day,
             COUNT(*) AS order_count,
             SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS success_count,
             SUM(CASE WHEN status = ? THEN amount ELSE 0 END) AS total_amount,
@@ -74,7 +87,7 @@ func HourlyOrderStats(start, end time.Time) ([]DailyStat, error) {
 			mdb.StatusPaySuccess, mdb.StatusPaySuccess, mdb.StatusPaySuccess).
 		Where("created_at >= ?", sqliteTime(start)).
 		Where("created_at <= ?", sqliteTime(end)).
-		Group("strftime('%Y-%m-%d %H:00', created_at)").
+		Group(sqlHourExpr).
 		Order("day ASC").
 		Scan(&rows).Error
 	if err != nil {
@@ -132,11 +145,11 @@ func fillHourlyStats(start, end time.Time, rows []DailyStat) []DailyStat {
 func DailyAssetByAddress(start, end time.Time) ([]AddressDailyStat, error) {
 	var rows []AddressDailyStat
 	err := dao.Mdb.Model(&mdb.Orders{}).
-		Select("DATE(created_at) AS day, receive_address AS address, SUM(actual_amount) AS actual_amount").
+		Select(sqlDayExpr + " AS day, receive_address AS address, SUM(actual_amount) AS actual_amount").
 		Where("status = ?", mdb.StatusPaySuccess).
 		Where("created_at >= ?", sqliteTime(start)).
 		Where("created_at <= ?", sqliteTime(end)).
-		Group("DATE(created_at), receive_address").
+		Group(sqlDayExpr + ", receive_address").
 		Order("day ASC").
 		Scan(&rows).Error
 	if err != nil {
@@ -150,11 +163,11 @@ func DailyAssetByAddress(start, end time.Time) ([]AddressDailyStat, error) {
 func HourlyAssetByAddress(start, end time.Time) ([]AddressDailyStat, error) {
 	var rows []AddressDailyStat
 	err := dao.Mdb.Model(&mdb.Orders{}).
-		Select("strftime('%Y-%m-%d %H:00', created_at) AS day, receive_address AS address, SUM(actual_amount) AS actual_amount").
+		Select(sqlHourExpr + " AS day, receive_address AS address, SUM(actual_amount) AS actual_amount").
 		Where("status = ?", mdb.StatusPaySuccess).
 		Where("created_at >= ?", sqliteTime(start)).
 		Where("created_at <= ?", sqliteTime(end)).
-		Group("strftime('%Y-%m-%d %H:00', created_at), receive_address").
+		Group(sqlHourExpr + ", receive_address").
 		Order("day ASC").
 		Scan(&rows).Error
 	if err != nil {
